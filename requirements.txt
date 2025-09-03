@@ -1,0 +1,6 @@
+gradio
+requests
+python-dotenv
+pdfplumber
+python-docx
+textract
