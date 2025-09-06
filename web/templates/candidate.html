@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Кандидат #{{ c.id }}</h1>
+<div class="grid">
+  <section>
+    <h3>Паспорт</h3>
+    <ul class="kv">
+      <li><b>ФИО:</b> {{ c.full_name or "—" }}</li>
+      <li><b>Возраст:</b> {{ c.age or "—" }}</li>
+      <li><b>Пол:</b> {{ c.gender or "—" }}</li>
+      <li><b>Телефон:</b> {{ c.phone or "—" }}</li>
+      <li><b>Адрес:</b> {{ c.address or "—" }}</li>
+      <li><b>Статус:</b> <span class="badge">{{ status_label }}</span></li>
+      <li><b>Файл:</b> {{ c.resume_path }}</li>
+      <li><b>Создан:</b> {{ c.created_at }}</li>
+    </ul>
+
+    <form method="post" action="/candidates/{{ c.id }}/status" class="inline">
+      <select name="new_status">
+        {% for code,label in STATUS_CHOICES %}
+          <option value="{{ code }}" {% if code==c.candidate_status %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <button>Обновить статус</button>
+    </form>
+  </section>
+
+  <section>
+    <h3>Анализы</h3>
+    {% if analyses %}
+      <ul>
+        {% for a in analyses %}
+          <li>
+            <div><b>Средний балл:</b> {{ a.avg_score }} | <b>Вердикт:</b> {{ a.verdict }}</div>
+            <div><b>Вывод:</b> {{ a.summary }}</div>
+            <div class="muted">{{ a.created_at }}</div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="muted">Пока нет записей анализа.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Кандидаты</h1>
+
+<form method="get" class="filters">
+  <input type="text" name="q" placeholder="ФИО/телефон" value="{{ q }}">
+  <select name="status">
+    <option value="">— любой статус —</option>
+    {% for code,label in STATUS_CHOICES %}
+      <option value="{{ code }}" {% if filter_status==code %}selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <button>Фильтр</button>
+</form>
+
+<table class="table">
+  <thead><tr><th>ID</th><th>ФИО</th><th>Телефон</th><th>Статус</th><th>Средний балл</th><th>Создан</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td><a href="/candidates/{{ r.id }}">{{ r.full_name or "—" }}</a></td>
+      <td>{{ r.phone or "—" }}</td>
+      <td><span class="badge">{{ r.status_label }}</span></td>
+      <td>{{ r.avg_score if r.avg_score is not none else "—" }}</td>
+      <td>{{ r.created_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

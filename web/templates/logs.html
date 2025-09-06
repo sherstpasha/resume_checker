@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Логи Telegram</h1>
+<table class="table">
+  <thead><tr><th>ID</th><th>chat_id</th><th>user_id</th><th>username</th><th>event</th><th>payload</th><th>created</th></tr></thead>
+  <tbody>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r.id }}</td>
+        <td>{{ r.chat_id }}</td>
+        <td>{{ r.user_id }}</td>
+        <td>{{ r.username }}</td>
+        <td>{{ r.event }}</td>
+        <td><pre style="white-space: pre-wrap">{{ r.payload }}</pre></td>
+        <td class="muted">{{ r.created_at }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

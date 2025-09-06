@@ -150,3 +150,135 @@ def load_job_requirements(path):
                 break
             requirements.append(line.strip())
     return [r for r in requirements if r]
+
+
+
+# tts_module.py
+import asyncio
+import edge_tts
+import simpleaudio as sa
+import tempfile
+import os
+import torch
+import soundfile as sf
+import pygame
+
+
+class EdgeTTS:
+    def __init__(self, voice="ru-RU-DmitryNeural", rate="+10%", pitch="+0Hz"):
+        self.voice = voice
+        self.rate = rate
+        self.pitch = pitch
+
+    async def synthesize(self, text: str, out_path: str = None) -> str:
+        if out_path is None:
+            fd, out_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+
+        communicate = edge_tts.Communicate(text, self.voice, rate=self.rate, pitch=self.pitch)
+        with open(out_path, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+        return out_path
+
+    def speak(self, text: str):
+        path = asyncio.run(self.synthesize(text))
+        pygame.mixer.init()
+        pygame.mixer.music.load(path)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+        return path
+
+
+class SileroTTS:
+    def __init__(self, device=None, speaker="kseniya", sample_rate=48000):
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.speaker = speaker
+        self.sample_rate = sample_rate
+
+        self.model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-models",
+            model="silero_tts",
+            language="ru",
+            speaker="v4_ru"
+        )
+        self.model.to(self.device)
+
+    def synthesize(self, text: str, out_path: str = None) -> str:
+        if out_path is None:
+            fd, out_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+
+        audio = self.model.apply_tts(
+            text=text,
+            speaker=self.speaker,
+            sample_rate=self.sample_rate
+        )
+        sf.write(out_path, audio, self.sample_rate)
+        return out_path
+
+    def speak(self, text: str):
+        path = self.synthesize(text)
+        wave_obj = sa.WaveObject.from_wave_file(path)
+        play_obj = wave_obj.play()
+        play_obj.wait_done()
+        return path
+
+
+class FallbackTTS:
+    """Сначала EdgeTTS, если ошибка → SileroTTS"""
+    def __init__(self, **kwargs):
+        self.edge = EdgeTTS(
+            voice=kwargs.get("voice", "ru-RU-DmitryNeural"),
+            rate=kwargs.get("rate", "+10%"),
+            pitch=kwargs.get("pitch", "+0Hz"),
+        )
+        self.silero = SileroTTS(
+            device=kwargs.get("device"),
+            speaker=kwargs.get("speaker", "kseniya"),
+            sample_rate=kwargs.get("sample_rate", 48000),
+        )
+
+    def speak(self, text: str):
+        self.silero.speak(text)
+#        try:
+#            print("🎤 [TTS] EdgeTTS…")
+#            return self.edge.speak(text)
+#        except Exception as e:
+#            print(f"⚠️ EdgeTTS упал ({e}), переключаюсь на Silero.")
+#            return self.silero.speak(text)
+
+def extract_json_block(text: str) -> str:
+    """
+    Возвращает строку с чистым JSON:
+    - убирает обёртку ```json ... ``` или ```
+    - извлекает первую { ... } или [ ... ]
+    """
+    if not text:
+        return ""
+    t = strip_thinking_tags(text).strip()
+
+    # срезать ограды кода
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.IGNORECASE)
+
+    m = re.search(r"\{.*\}", t, flags=re.DOTALL)
+    if m:
+        return m.group(0)
+    m = re.search(r"\[.*\]", t, flags=re.DOTALL)
+    if m:
+        return m.group(0)
+    return t.strip()
+
+
+def parse_json_safely(text: str):
+    """
+    Пытается распарсить JSON-ответ модели, даже если он в код-блоке.
+    Возвращает dict/list или бросает ValueError.
+    """
+    payload = extract_json_block(text)
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON decode failed: {e}\nExtracted: {payload[:500]}")

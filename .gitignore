@@ -1,3 +1,78 @@
-/env
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
 
+# Virtual envs
 .env
+.env.*
+venv/
+.venv/
+env/
+ENV/
+pip-wheel-metadata/
+pip-log.txt
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.coverage
+.coverage.*
+.cache/
+.dmypy.json
+
+# Editors / OS
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs / runtime
+*.log
+logs/
+celerybeat-schedule
+*.pid
+
+# Type-check / lint
+pyrightconfig.json
+.dmypy.json
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local data
+storage/
+uploads/
+tmp/
+temp/
+
+# Databases
+*.sqlite
+*.sqlite3
+*.db
+hr_bot.sqlite3
+
+# Audio/TTS temp (если используешь)
+*.wav
+*.mp3
+
+# Docker / compose overrides
+docker-compose.override.yml
+
+# Poetry / pipenv (если не используешь — всё равно игнор ок)
+.poetry/
+Pipfile.lock
+poetry.lock
+
+# Optional: keep a sample env
+!.env.example
