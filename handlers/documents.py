@@ -10,7 +10,7 @@ from utils import (
     list_requirement_files,
 )
 from agents.resume_analyzer import ResumeAnalyzerAgent
-from db import create_candidate_and_analysis, log_event
+from db import create_candidate_and_analysis, log_event, create_candidate_pending, save_analysis_for_candidate
 
 
 # Подтягиваем .env при локальном запуске
@@ -135,100 +135,81 @@ async def on_document(message: types.Message):
         )
         return
 
-    # Анализ с выбором подходящей вакансии
+    # --- Ставит в очередь: создаём кандидата со статусом ожидания и запускаем фоновую задачу анализа ---
     try:
-        result = agent.analyze_and_questions(resume_text, job_sets)
-        print(result)
-    except Exception as e:
-        await log_event(
-            message.chat.id,
-            message.from_user.id if message.from_user else None,
-            message.from_user.username if message.from_user else None,
-            "analyze_failed",
-            {"error": str(e)},
+        candidate_id = await create_candidate_pending(
+            resume_path=local_path, raw_resume_text=resume_text
         )
-        await message.answer(f"Ошибка анализа: {e}")
+    except Exception as e:
+        await message.answer(f"Не удалось создать запись кандидата: {e}")
         return
 
-    # --- Парсим среднюю оценку и общий вывод ---
-    avg_score: int | None = None
-    summary = ""
-    try:
-        if isinstance(result, dict) and isinstance(result.get("Анализ"), dict):
-            avg_score = int(result["Анализ"].get("Средняя оценка"))
-            summary = str(result["Анализ"].get("Общий вывод", ""))
-    except Exception:
-        pass
-
-    # --- Статус "это резюме" (если есть в JSON) ---
-    status = (result.get("Статус") or {}) if isinstance(result, dict) else {}
-    is_resume = bool(status.get("Это резюме", True))
-
-    # --- Сохраняем кандидата и анализ в БД ---
-    try:
-        await create_candidate_and_analysis(
-            full_name=(
-                (result.get("Кандидат", {}) or {}).get("ФИО")
-                if isinstance(result, dict)
-                else None
-            ),
-            age=(
-                (result.get("Кандидат", {}) or {}).get("Возраст")
-                if isinstance(result, dict)
-                else None
-            ),
-            gender=(
-                (result.get("Кандидат", {}) or {}).get("Пол")
-                if isinstance(result, dict)
-                else None
-            ),
-            phone=(
-                (result.get("Кандидат", {}) or {}).get("Телефон")
-                if isinstance(result, dict)
-                else None
-            ),
-            address=(
-                (result.get("Кандидат", {}) or {}).get("Адрес")
-                if isinstance(result, dict)
-                else None
-            ),
-            resume_path=local_path,
-            raw_resume_text=resume_text,
-            avg_score=avg_score if isinstance(avg_score, int) else -1,
-            verdict=(
-                "positive"
-                if (isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD)
-                else "negative"
-            ),
-            summary=summary or "—",
-            raw_json=result,
-            is_resume=is_resume,
-        )
-    except Exception as e:
-        await log_event(
-            message.chat.id,
-            message.from_user.id if message.from_user else None,
-            message.from_user.username if message.from_user else None,
-            "db_save_failed",
-            {"error": str(e)},
-        )
-        # продолжаем отвечать пользователю даже если запись в БД не удалась
-
-    # --- Ответ кандидату по порогу ---
-    if isinstance(avg_score, int):
-        if avg_score >= RESUME_THRESHOLD:
-            await message.answer(
-                f"Поздравляю! Ваше резюме прошло предварительную проверку (средняя оценка: {avg_score}%). "
-                f"Мы свяжемся с вами для звонка/собеседования."
+    import asyncio
+    async def _run_analysis_and_notify():
+        try:
+            # глобальная очередь агента, чтобы не было параллельных запросов
+            from db import acquire_agent_lock, release_agent_lock
+            locked = await acquire_agent_lock("screening_agent", timeout_sec=1800, poll_sec=0.5)
+            if not locked:
+                await message.answer("Очередь обработки занята. Попробуйте позже.")
+                return
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, lambda: agent.analyze_and_questions(resume_text, job_sets)
             )
-        else:
-            feedback = (
-                summary
-                or "Спасибо за интерес к вакансии. Сейчас соответствие недостаточно."
+            avg_score: int | None = None
+            summary = ""
+            try:
+                if isinstance(result, dict) and isinstance(result.get("Анализ"), dict):
+                    avg_score = int(result["Анализ"].get("Средняя оценка"))
+                    summary = str(result["Анализ"].get("Общий вывод", ""))
+            except Exception:
+                pass
+            status = (result.get("Статус") or {}) if isinstance(result, dict) else {}
+            is_resume = bool(status.get("Это резюме", True))
+
+            await save_analysis_for_candidate(
+                candidate_id=candidate_id,
+                avg_score=avg_score if isinstance(avg_score, int) else -1,
+                verdict=(
+                    "positive"
+                    if (isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD)
+                    else "negative"
+                ),
+                summary=summary or "—",
+                raw_json=result,
+                is_resume=is_resume,
+                full_name=(result.get("Кандидат", {}) or {}).get("ФИО") if isinstance(result, dict) else None,
+                age=(result.get("Кандидат", {}) or {}).get("Возраст") if isinstance(result, dict) else None,
+                gender=(result.get("Кандидат", {}) or {}).get("Пол") if isinstance(result, dict) else None,
+                phone=(result.get("Кандидат", {}) or {}).get("Телефон") if isinstance(result, dict) else None,
+                address=(result.get("Кандидат", {}) or {}).get("Адрес") if isinstance(result, dict) else None,
             )
-            await message.answer(
-                f"К сожалению, предварительная оценка ниже порога (средняя: {avg_score}%).\n"
-                f"Обратная связь: {feedback}"
+
+            if isinstance(avg_score, int):
+                if avg_score >= RESUME_THRESHOLD:
+                    await message.answer(
+                        f"Ваше резюме прошло предварительную проверку (средняя оценка: {avg_score}%). Мы свяжемся с вами."
+                    )
+                else:
+                    feedback = summary or "Спасибо за интерес к вакансии. Сейчас соответствие недостаточно."
+                    await message.answer(
+                        f"Предварительная оценка ниже порога (средняя: {avg_score}%).\nОбратная связь: {feedback}"
+                    )
+            else:
+                await message.answer("Получен нестандартный ответ от анализатора.")
+        except Exception as e:
+            await log_event(
+                message.chat.id,
+                message.from_user.id if message.from_user else None,
+                message.from_user.username if message.from_user else None,
+                "analyze_failed_bg",
+                {"error": str(e)},
             )
-    else:
-        await message.answer("Получен нестандартный ответ от анализатора.")
+        finally:
+            try:
+                await release_agent_lock("screening_agent")
+            except Exception:
+                pass
+
+    asyncio.create_task(_run_analysis_and_notify())

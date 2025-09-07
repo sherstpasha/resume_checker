@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS tg_logs (
   payload TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Простая таблица для блокировок агента (mutex через уникальный ключ)
+CREATE TABLE IF NOT EXISTS agent_locks (
+  name TEXT PRIMARY KEY
+);
 """
 
 
@@ -140,6 +145,117 @@ async def create_candidate_and_analysis(
         analysis_id = cur2.lastrowid
 
         return candidate_id, analysis_id
+
+
+async def create_candidate_pending(
+    *,
+    resume_path: str | None,
+    raw_resume_text: str | None,
+) -> int:
+    """Создаёт кандидата со статусом screen_pending и возвращает candidate_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO candidates(full_name,age,gender,phone,address,resume_path,raw_resume_text,candidate_status) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                resume_path,
+                (raw_resume_text or "")[:50000],
+                "screen_pending",
+            ),
+        )
+        await db.commit()
+        return int(cur.lastrowid)
+
+
+async def save_analysis_for_candidate(
+    *,
+    candidate_id: int,
+    avg_score: int,
+    verdict: str,
+    summary: str,
+    raw_json: str | dict,
+    is_resume: bool,
+    full_name: str | None = None,
+    age: int | None = None,
+    gender: str | None = None,
+    phone: str | None = None,
+    address: str | None = None,
+    raw_resume_text: str | None = None,
+) -> int:
+    """Обновляет карточку кандидата полями из анализа и создаёт запись анализа. Возвращает analysis_id."""
+    if isinstance(raw_json, (dict, list)):
+        raw_json = json.dumps(raw_json, ensure_ascii=False)
+
+    thr = int(os.getenv("RESUME_THRASH", "75"))
+    new_status = (
+        "screen_passed"
+        if (is_resume and isinstance(avg_score, int) and avg_score >= thr)
+        else "screen_failed"
+    )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # update candidate fields
+        await db.execute(
+            "UPDATE candidates SET full_name=COALESCE(?,full_name), age=COALESCE(?,age), gender=COALESCE(?,gender), "
+            "phone=COALESCE(?,phone), address=COALESCE(?,address), raw_resume_text=COALESCE(?,raw_resume_text), candidate_status=? "
+            "WHERE id=?",
+            (
+                full_name,
+                age,
+                gender,
+                phone,
+                address,
+                (raw_resume_text or None),
+                new_status,
+                candidate_id,
+            ),
+        )
+        await db.commit()
+
+        # insert analysis
+        cur2 = await db.execute(
+            "INSERT INTO analyses(candidate_id,avg_score,verdict,summary,raw_json,is_resume) VALUES (?,?,?,?,?,?)",
+            (
+                candidate_id,
+                int(avg_score) if isinstance(avg_score, int) else -1,
+                verdict,
+                (summary or "")[:2000],
+                raw_json,
+                1 if is_resume else 0,
+            ),
+        )
+        await db.commit()
+        return int(cur2.lastrowid)
+
+
+async def acquire_agent_lock(name: str = "global", timeout_sec: int = 600, poll_sec: float = 0.5) -> bool:
+    """Пытается захватить глобальную блокировку агента через SQLite. Возвращает True/False."""
+    import time
+    deadline = time.monotonic() + max(1, timeout_sec)
+    while True:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # на всякий случай обеспечим таблицу
+            await db.execute("CREATE TABLE IF NOT EXISTS agent_locks(name TEXT PRIMARY KEY)")
+            cur = await db.execute("INSERT OR IGNORE INTO agent_locks(name) VALUES (?)", (name,))
+            await db.commit()
+            if cur.rowcount == 1:
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        # ждём и повторяем
+        import asyncio
+        await asyncio.sleep(poll_sec)
+
+
+async def release_agent_lock(name: str = "global") -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM agent_locks WHERE name=?", (name,))
+        await db.commit()
 
 
 async def log_event(

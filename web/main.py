@@ -2,7 +2,7 @@ import os
 import json
 import html
 import aiosqlite
-from fastapi import FastAPI, Request, Form, UploadFile, File
+from fastapi import FastAPI, Request, Form, UploadFile, File, BackgroundTasks
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -439,34 +439,37 @@ async def delete_candidate(cid: int):
 
 @app.get("/stats", response_class=HTMLResponse)
 async def stats(request: Request):
+    import json as _json
+    import re as _re
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         # распределение статусов
         cur = await db.execute(
             "SELECT candidate_status AS status, COUNT(*) AS cnt FROM candidates GROUP BY candidate_status"
         )
-        by_status = [dict(r) for r in await cur.fetchall()]
+        by_status_rows = [dict(r) for r in await cur.fetchall()]
 
-        # средний балл по последним анализам
+        # последние анализы по каждому кандидату с данными кандидата
         cur2 = await db.execute(
             """
-            SELECT AVG(t.avg_score) AS avg_score
-            FROM (
+            SELECT c.id as cid, c.full_name, c.gender, c.address, c.age,
+                   a.avg_score, a.summary, a.raw_json
+            FROM candidates c
+            JOIN (
               SELECT candidate_id, MAX(id) AS last_id
               FROM analyses GROUP BY candidate_id
-            ) last
-            JOIN analyses t ON t.id = last.last_id
+            ) last ON last.candidate_id = c.id
+            JOIN analyses a ON a.id = last.last_id
             """
         )
-        avg_row = await cur2.fetchone()
-        avg_all = (
-            avg_row["avg_score"]
-            if avg_row and avg_row["avg_score"] is not None
-            else None
-        )
+        last_rows = [dict(r) for r in await cur2.fetchall()]
 
-    # подготовка для шаблона
-    total = sum(r["cnt"] for r in by_status) or 0
+    # avg score
+    scores = [r["avg_score"] for r in last_rows if r.get("avg_score") is not None]
+    avg_all = (sum(scores) / len(scores)) if scores else None
+
+    # by status
+    total = sum(r["cnt"] for r in by_status_rows) or 0
     by_status = [
         {
             "label": status_label(r["status"]),
@@ -474,8 +477,75 @@ async def stats(request: Request):
             "cnt": r["cnt"],
             "pct": (r["cnt"] / total * 100 if total else 0),
         }
-        for r in by_status
+        for r in by_status_rows
     ]
+
+    # vacancy, gender, city aggregates
+    vacancy_counts: dict[str, int] = {}
+    gender_counts: dict[str, int] = {}
+    city_counts: dict[str, int] = {}
+    age_by_vacancy: dict[str, list[int]] = {}
+
+    def city_from_address(addr: str | None) -> str:
+        if not addr:
+            return "—"
+        s = str(addr).strip()
+        for sep in [",", "—", "-", ";", "/"]:
+            if sep in s:
+                s = s.split(sep, 1)[0]
+                break
+        return s.strip() or "—"
+
+    for r in last_rows:
+        # gender
+        g = (r.get("gender") or "не указан").strip().lower()
+        gender_counts[g] = gender_counts.get(g, 0) + 1
+        # city
+        city = city_from_address(r.get("address"))
+        city_counts[city] = city_counts.get(city, 0) + 1
+
+        # chosen vacancy from raw_json
+        chosen = None
+        try:
+            rep = _json.loads(r.get("raw_json") or "")
+            if isinstance(rep, dict):
+                anal = rep.get("Анализ") or {}
+                if isinstance(anal, dict):
+                    v = anal.get("Выбранная вакансия")
+                    if isinstance(v, str) and v.strip():
+                        chosen = v.strip()
+        except Exception:
+            pass
+        if not chosen:
+            s = (r.get("summary") or "").strip()
+            m = _re.search(r"ваканси[ие]\s+['\"]([^'\"]+)['\"]", s, flags=_re.IGNORECASE)
+            if m:
+                chosen = m.group(1).strip()
+        chosen = chosen or "—"
+        vacancy_counts[chosen] = vacancy_counts.get(chosen, 0) + 1
+
+        # age per vacancy
+        try:
+            age = int(r["age"]) if r.get("age") is not None else None
+        except Exception:
+            age = None
+        if age is not None:
+            age_by_vacancy.setdefault(chosen, []).append(age)
+
+    vac_labels = list(vacancy_counts.keys())
+    vac_values = [vacancy_counts[k] for k in vac_labels]
+    gen_labels = list(gender_counts.keys())
+    gen_values = [gender_counts[k] for k in gen_labels]
+    top_cities = sorted(city_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    city_labels = [c for c, _ in top_cities]
+    city_values = [n for _, n in top_cities]
+    age_labels = []
+    age_values = []
+    for k, arr in age_by_vacancy.items():
+        if arr:
+            age_labels.append(k)
+            age_values.append(sum(arr) / len(arr))
+
     return templates.TemplateResponse(
         "stats.html",
         {
@@ -483,6 +553,14 @@ async def stats(request: Request):
             "by_status": by_status,
             "avg_all": avg_all,
             "total": total,
+            "vac_labels": _json.dumps(vac_labels, ensure_ascii=False),
+            "vac_values": _json.dumps(vac_values, ensure_ascii=False),
+            "gen_labels": _json.dumps(gen_labels, ensure_ascii=False),
+            "gen_values": _json.dumps(gen_values, ensure_ascii=False),
+            "city_labels": _json.dumps(city_labels, ensure_ascii=False),
+            "city_values": _json.dumps(city_values, ensure_ascii=False),
+            "age_labels": _json.dumps(age_labels, ensure_ascii=False),
+            "age_values": _json.dumps(age_values, ensure_ascii=False),
         },
     )
 
@@ -560,7 +638,7 @@ async def requirements_delete(filename: str = Form(...)):
 
 
 @app.post("/candidates/upload")
-async def candidates_upload(files: List[UploadFile] = File(...)):
+async def candidates_upload(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
     job_sets = _load_all_job_sets()
     if not job_sets:
         return RedirectResponse(url="/requirements", status_code=303)
@@ -582,43 +660,57 @@ async def candidates_upload(files: List[UploadFile] = File(...)):
         if not (resume_text or "").strip():
             continue
 
-        # analyze
+        # create pending candidate and enqueue background analysis
         try:
-            result = agent.analyze_and_questions(resume_text, job_sets)
+            from db import create_candidate_pending, save_analysis_for_candidate
+            candidate_id = await create_candidate_pending(resume_path=dest, raw_resume_text=resume_text)
         except Exception:
             continue
 
-        # parse avg score, summary, status
-        avg_score: int | None = None
-        summary = ""
-        try:
-            if isinstance(result, dict) and isinstance(result.get("Анализ"), dict):
-                avg_score = int(result["Анализ"].get("Средняя оценка"))
-                summary = str(result["Анализ"].get("Общий вывод", ""))
-        except Exception:
-            pass
-        status = (result.get("Статус") or {}) if isinstance(result, dict) else {}
-        is_resume = bool(status.get("Это резюме", True))
+        async def _bg_analyze_and_store(cid: int, text: str, sets: list[dict]):
+            try:
+                import asyncio as _asyncio
+                from db import acquire_agent_lock, release_agent_lock, save_analysis_for_candidate
+                # очередь: один агент обрабатывает по очереди
+                locked = await acquire_agent_lock("screening_agent", timeout_sec=1800, poll_sec=0.5)
+                if not locked:
+                    return
+                loop = _asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, lambda: agent.analyze_and_questions(text, sets))
+                # parse
+                avg_score: int | None = None
+                summary = ""
+                try:
+                    if isinstance(result, dict) and isinstance(result.get("Анализ"), dict):
+                        avg_score = int(result["Анализ"].get("Средняя оценка"))
+                        summary = str(result["Анализ"].get("Общий вывод", ""))
+                except Exception:
+                    pass
+                status = (result.get("Статус") or {}) if isinstance(result, dict) else {}
+                is_resume = bool(status.get("Это резюме", True))
+                await save_analysis_for_candidate(
+                    candidate_id=cid,
+                    avg_score=avg_score if isinstance(avg_score, int) else -1,
+                    verdict=("positive" if (isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD) else "negative"),
+                    summary=summary or "—",
+                    raw_json=result,
+                    is_resume=is_resume,
+                    full_name=(result.get("Кандидат", {}) or {}).get("ФИО") if isinstance(result, dict) else None,
+                    age=(result.get("Кандидат", {}) or {}).get("Возраст") if isinstance(result, dict) else None,
+                    gender=(result.get("Кандидат", {}) or {}).get("Пол") if isinstance(result, dict) else None,
+                    phone=(result.get("Кандидат", {}) or {}).get("Телефон") if isinstance(result, dict) else None,
+                    address=(result.get("Кандидат", {}) or {}).get("Адрес") if isinstance(result, dict) else None,
+                )
+            except Exception:
+                pass
+            finally:
+                try:
+                    await release_agent_lock("screening_agent")
+                except Exception:
+                    pass
 
-        # save to DB
-        try:
-            await create_candidate_and_analysis(
-                full_name=(result.get("Кандидат", {}) or {}).get("ФИО") if isinstance(result, dict) else None,
-                age=(result.get("Кандидат", {}) or {}).get("Возраст") if isinstance(result, dict) else None,
-                gender=(result.get("Кандидат", {}) or {}).get("Пол") if isinstance(result, dict) else None,
-                phone=(result.get("Кандидат", {}) or {}).get("Телефон") if isinstance(result, dict) else None,
-                address=(result.get("Кандидат", {}) or {}).get("Адрес") if isinstance(result, dict) else None,
-                resume_path=dest,
-                raw_resume_text=resume_text,
-                avg_score=avg_score if isinstance(avg_score, int) else -1,
-                verdict=("positive" if (isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD) else "negative"),
-                summary=summary or "—",
-                raw_json=result,
-                is_resume=is_resume,
-            )
-            saved_any = True
-        except Exception:
-            continue
+        background_tasks.add_task(_bg_analyze_and_store, candidate_id, resume_text, job_sets)
+        saved_any = True
 
     return RedirectResponse(url="/", status_code=303)
 def _load_all_job_sets():

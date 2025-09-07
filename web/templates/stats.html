@@ -22,4 +22,58 @@
     </p>
   </section>
 </div>
+
+<div class="grid">
+  <section>
+    <h3>Кандидаты по вакансиям</h3>
+    <canvas id="chartVac" height="140"></canvas>
+  </section>
+  <section>
+    <h3>Гендер</h3>
+    <canvas id="chartGen" height="140"></canvas>
+  </section>
+</div>
+
+<div class="grid">
+  <section>
+    <h3>Топ городов</h3>
+    <canvas id="chartCity" height="160"></canvas>
+  </section>
+  <section>
+    <h3>Средний возраст по вакансиям</h3>
+    <canvas id="chartAge" height="160"></canvas>
+  </section>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+  const vacLabels = {{ vac_labels|safe }};
+  const vacValues = {{ vac_values|safe }};
+  const genLabels = {{ gen_labels|safe }};
+  const genValues = {{ gen_values|safe }};
+  const cityLabels = {{ city_labels|safe }};
+  const cityValues = {{ city_values|safe }};
+  const ageLabels = {{ age_labels|safe }};
+  const ageValues = {{ age_values|safe }};
+
+  function mkBar(ctx, labels, data, title) {
+    return new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: title, data, backgroundColor: '#4f81bd' }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+  }
+  function mkPie(ctx, labels, data) {
+    return new Chart(ctx, {
+      type: 'pie',
+      data: { labels, datasets: [{ data, backgroundColor: ['#4caf50','#ffc107','#f44336','#2196f3','#9c27b0','#795548'] }] },
+      options: { responsive: true }
+    });
+  }
+
+  if (vacLabels.length) mkBar(document.getElementById('chartVac'), vacLabels, vacValues, 'Кандидаты');
+  if (genLabels.length) mkPie(document.getElementById('chartGen'), genLabels, genValues);
+  if (cityLabels.length) mkBar(document.getElementById('chartCity'), cityLabels, cityValues, 'Кандидаты');
+  if (ageLabels.length) mkBar(document.getElementById('chartAge'), ageLabels, ageValues, 'Возраст');
+</script>
 {% endblock %}

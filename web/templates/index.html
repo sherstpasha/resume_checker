@@ -11,7 +11,6 @@
 {% endif %}
 
 <form method="get" class="filters">
-  <input type="text" name="q" placeholder="ФИО/телефон" value="{{ q }}">
   <select name="status">
     <option value="">— любой статус —</option>
     {% for code,label in STATUS_CHOICES %}
@@ -36,4 +35,8 @@
   {% endfor %}
   </tbody>
 </table>
+<script>
+  // Автообновление списка каждые 10 секунд
+  setInterval(() => location.reload(), 10000);
+</script>
 {% endblock %}

@@ -137,7 +137,24 @@ def extract_text_from_txt(path):
         return f.read()
 
 
-def extract_text_from_doc_or_rtf(path):
+def extract_text_from_rtf(path):
+    # Prefer pure-Python parser to avoid external deps
+    try:
+        from striprtf.striprtf import rtf_to_text
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.read()
+        return rtf_to_text(data) or ""
+    except Exception:
+        # fallback to textract if available
+        try:
+            text = textract.process(path)
+            return text.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+
+def extract_text_from_doc(path):
+    # Legacy .doc — rely on textract if available in env, else empty
     try:
         text = textract.process(path)
         return text.decode("utf-8", errors="ignore")
@@ -153,8 +170,10 @@ def extract_text(file_path):
         return extract_text_from_docx(file_path)
     elif ext.endswith(".txt"):
         return extract_text_from_txt(file_path)
-    elif ext.endswith(".doc") or ext.endswith(".rtf"):
-        return extract_text_from_doc_or_rtf(file_path)
+    elif ext.endswith(".rtf"):
+        return extract_text_from_rtf(file_path)
+    elif ext.endswith(".doc"):
+        return extract_text_from_doc(file_path)
     else:
         return ""
 
