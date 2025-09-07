@@ -1,4 +1,5 @@
 import json
+import os
 import requests
 from utils import strip_thinking_tags
 from utils import FallbackTTS
@@ -22,7 +23,9 @@ class HRInterviewerAgent:
 
         # STT / TTS
         self.device = device
-        self.stt_model = whisper.load_model("small", device=device)
+        # модель Whisper по умолчанию — 'medium' (лучше распознаёт, чем 'small')
+        whisper_model = os.getenv("WHISPER_MODEL", "medium")
+        self.stt_model = whisper.load_model(whisper_model, device=device)
         self.tts = FallbackTTS()
 
         # Системный промпт (обновлённый)

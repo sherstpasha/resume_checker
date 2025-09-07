@@ -120,4 +120,25 @@
     <p class="muted">Пока нет записей анализа.</p>
   {% endif %}
 </section>
+
+{% if last_interview %}
+<section class="card">
+  <h3>Последнее интервью</h3>
+  <div class="muted">Дата: {{ last_interview.created_at }}</div>
+  {% if last_interview.log %}
+    <div class="resume-box" style="max-height:300px;">
+      {% for m in last_interview.log %}
+        <div><b>{{ '🤖' if m.role=='assistant' else ('👤' if m.role=='user' else 'ℹ️') }}</b> {{ m.text }}</div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="muted">Листинг отсутствует</div>
+  {% endif %}
+  {% if last_interview.report %}
+    <details class="report" style="margin-top:8px"><summary>Финальный отчёт (JSON)</summary>
+      <pre class="resume-raw">{{ last_interview.report | tojson(indent=2) }}</pre>
+    </details>
+  {% endif %}
+</section>
+{% endif %}
 {% endblock %}

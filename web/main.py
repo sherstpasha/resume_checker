@@ -4,15 +4,28 @@ import html
 import aiosqlite
 from fastapi import FastAPI, Request, Form, UploadFile, File, BackgroundTasks
 from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from typing import List
 from dotenv import load_dotenv
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    RTCConfiguration,
+    RTCIceServer,
+)
 from aiortc.contrib.media import MediaBlackhole, MediaRelay
-from utils import extract_text, load_job_requirements_many, parse_job_paths_env, list_requirement_files
+from silero_vad import load_silero_vad, get_speech_timestamps
+from utils import (
+    extract_text,
+    load_job_requirements_many,
+    parse_job_paths_env,
+    list_requirement_files,
+)
 from agents.resume_analyzer import ResumeAnalyzerAgent
-from db import create_candidate_and_analysis
+import torch
+from db import create_candidate_and_analysis, save_interview, init_db
 
 # Load .env so env vars are available when running via uvicorn
 load_dotenv()
@@ -25,10 +38,17 @@ MODEL_NAME = os.getenv("MODEL_NAME")
 FILES_DIR = os.getenv("FILES_DIR", "./storage")
 os.makedirs(FILES_DIR, exist_ok=True)
 RESUME_THRASH = os.getenv("RESUME_THRASH")
-RESUME_THRESHOLD = int(RESUME_THRASH) if RESUME_THRASH is not None else int(os.getenv("RESUME_THRESHOLD", "75"))
+RESUME_THRESHOLD = (
+    int(RESUME_THRASH)
+    if RESUME_THRASH is not None
+    else int(os.getenv("RESUME_THRESHOLD", "75"))
+)
 JOB_DESCRIPTION_PATHS = os.getenv("JOB_DESCRIPTION_PATHS", "")
 JOB_DESCRIPTION_PATH_LEGACY = os.getenv("JOB_DESCRIPTION_PATH", "")
 CALL_BASE_URL = os.getenv("CALL_BASE_URL", "http://localhost:8000")
+STT_DEVICE_PREF = (os.getenv("STT_DEVICE", "auto") or "auto").lower()  # auto|cuda|cpu
+DEBUG_VAD = (os.getenv("DEBUG_VAD", "0") or "0").lower() in ("1", "true", "yes", "on")
+RMS_GATE = float(os.getenv("RMS_GATE", "0.01"))  # fallback голосовой порог по RMS
 
 app = FastAPI(title="HR Resume Bot — Admin")
 app.mount(
@@ -45,10 +65,250 @@ agent = (
     else None
 )
 
+# Ensure DB schema (including new tables) exists on app start
+@app.on_event("startup")
+async def _startup_db():
+    try:
+        await init_db()
+    except Exception:
+        pass
+
+    # init VAD (Silero) once
+    global vad_model, _VAD_DEVICE, SAMPLERATE, CHUNK_SEC, PAUSE_CHUNKS
+    try:
+        _VAD_DEVICE = "cpu"  # silero VAD works great on CPU
+        vad_model = load_silero_vad(onnx=False)
+    except Exception:
+        vad_model = None
+    # align constants with CLI version
+    SAMPLERATE = 16000
+    CHUNK_SEC = 1
+    PAUSE_CHUNKS = 2
+
 # --- WebRTC globals ---
 peers: dict[str, RTCPeerConnection] = {}
+# map candidate id -> active peer connections (to force-close on finish)
+peers_by_cid: dict[int, set] = {}
 relay = MediaRelay()
 RTC_CONF = RTCConfiguration(iceServers=[RTCIceServer("stun:stun.l.google.com:19302")])
+
+
+# interview sessions per candidate id
+class _InterviewSession:
+    def __init__(self, cid: int):
+        self.cid = cid
+        self.interviewer = None
+        self.websockets: set[WebSocket] = set()
+        self.audio_buffer = []  # list of float32 numpy arrays (mono)
+        self.silent_chunks = 0
+        self.log: list[dict] = []
+        self.tasks: set = set()
+        self.ended: bool = False
+
+
+sessions: dict[int, _InterviewSession] = {}
+
+
+async def _get_or_create_session(cid: int) -> _InterviewSession:
+    sess = sessions.get(cid)
+    if not sess:
+        sess = _InterviewSession(cid)
+        # build interviewer from last analysis
+        try:
+            import json as _json
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT raw_json FROM analyses WHERE candidate_id=? ORDER BY id DESC LIMIT 1",
+                    (cid,),
+                )
+                row = await cur.fetchone()
+            analysis = {}
+            questions = []
+            if row and row["raw_json"]:
+                rep = (
+                    _json.loads(row["raw_json"])
+                    if isinstance(row["raw_json"], str)
+                    else row["raw_json"]
+                )
+                if isinstance(rep, dict):
+                    anal = rep.get("Анализ") or {}
+                    if isinstance(anal, dict):
+                        analysis = anal
+                    qs = rep.get("Вопросы") or []
+                    if isinstance(qs, list):
+                        questions = qs
+        except Exception:
+            analysis, questions = {}, []
+        # lazy import to avoid cost at module import
+        try:
+            from agents.interviewer import HRInterviewerAgent
+            # resolve device
+            try:
+                has_cuda = torch.cuda.is_available()
+            except Exception:
+                has_cuda = False
+            if (os.getenv("STT_DEVICE", "auto").lower() == "cuda") and not has_cuda:
+                print("[Interview] CUDA requested but not available. Falling back to CPU.")
+            stt_device = (
+                "cuda"
+                if ((os.getenv("STT_DEVICE", "auto").lower() in ("auto", "cuda")) and has_cuda)
+                else "cpu"
+            )
+            if stt_device == "cuda":
+                try:
+                    torch.set_float32_matmul_precision("high")
+                except Exception:
+                    pass
+            sess.interviewer = HRInterviewerAgent(
+                api_base_url=API_BASE_URL or "",
+                model_name=MODEL_NAME or "",
+                analysis=analysis,
+                questions=questions,
+                device=stt_device,
+            )
+        except Exception:
+            sess.interviewer = None
+        sessions[cid] = sess
+        # Console: devices & start banner
+        try:
+            dev = getattr(sess.interviewer, 'device', 'cpu') if sess.interviewer else 'n/a'
+            print(f"🖥️ Whisper: {str(dev).upper()} | VAD: {_VAD_DEVICE} | CID={cid}")
+            print("🎤 Собеседование началось. Говорите… (скажите 'стоп' чтобы завершить)")
+        except Exception:
+            pass
+    return sess
+
+
+async def _ws_broadcast(sess: _InterviewSession, payload: dict):
+    dead = []
+    for ws in list(sess.websockets):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        try:
+            sess.websockets.remove(ws)
+        except Exception:
+            pass
+
+
+def _resample_to_16k(x: "np.ndarray", orig_sr: int) -> "np.ndarray":
+    import numpy as _np
+
+    if orig_sr == 16000:
+        return x.astype("float32")
+    # simple linear resample
+    duration = x.shape[0] / float(orig_sr)
+    new_len = int(duration * 16000)
+    if new_len <= 0:
+        return _np.zeros(0, dtype="float32")
+    xp = _np.linspace(0, 1, x.shape[0])
+    fp = x.astype("float32")
+    x_new = _np.linspace(0, 1, new_len)
+    return _np.interp(x_new, xp, fp).astype("float32")
+
+
+async def _transcribe_and_reply(sess: _InterviewSession, audio_f32_16k: "np.ndarray"):
+    import numpy as _np
+
+    if sess.ended or sess.interviewer is None or getattr(sess.interviewer, "stt_model", None) is None:
+        return
+    try:
+        # normalize
+        if audio_f32_16k.size == 0:
+            return
+        m = _np.max(_np.abs(audio_f32_16k))
+        if m > 0:
+            audio_f32_16k = audio_f32_16k / m
+        result = sess.interviewer.stt_model.transcribe(
+            audio_f32_16k, language="ru", fp16=False
+        )
+        user_text = (result.get("text") or "").strip()
+        if not user_text:
+            return
+        await _ws_broadcast(sess, {"role": "user", "text": user_text})
+        try:
+            sess.log.append({"role": "user", "text": user_text})
+        except Exception:
+            pass
+        reply = sess.interviewer.reply(user_text)
+        await _ws_broadcast(sess, {"role": "assistant", "text": reply})
+        try:
+            sess.log.append({"role": "assistant", "text": reply})
+        except Exception:
+            pass
+        # optional: speak locally on server, not sent back yet
+        try:
+            sess.interviewer.tts.speak(reply)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+@app.websocket("/call/ws/{cid}")
+async def call_ws(ws: WebSocket, cid: int):
+    await ws.accept()
+    sess = await _get_or_create_session(cid)
+    sess.websockets.add(ws)
+    await _ws_broadcast(sess, {"role": "system", "text": "Подключено к сессии"})
+    try:
+        while True:
+            # keep alive; client doesn't send messages for now
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        try:
+            sess.websockets.remove(ws)
+        except Exception:
+            pass
+
+
+@app.post("/call/finish/{cid}")
+async def call_finish(cid: int):
+    sess = await _get_or_create_session(cid)
+    sess.ended = True
+    # cancel background tasks if any
+    try:
+        for t in list(sess.tasks):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        sess.tasks.clear()
+    except Exception:
+        pass
+    report = None
+    try:
+        if sess.interviewer and not sess.interviewer.finished:
+            report = sess.interviewer.finish_and_report()
+        if sess.interviewer:
+            sess.interviewer.finished = True
+    except Exception:
+        report = None
+    try:
+        await save_interview(cid, sess.log, report)
+    except Exception:
+        pass
+    try:
+        await _ws_broadcast(sess, {"role": "system", "text": "Интервью завершено"})
+    except Exception:
+        pass
+    # force-close peer connections for this candidate
+    try:
+        conns = list(peers_by_cid.get(cid, set()))
+        for pc in conns:
+            try:
+                await pc.close()
+            except Exception:
+                pass
+        peers_by_cid.pop(cid, None)
+    except Exception:
+        pass
+    return {"ok": True}
+
 
 STATUS_CHOICES = [
     ("screen_pending", "Ожидает скрининг"),
@@ -351,6 +611,11 @@ async def candidate_detail(request: Request, cid: int):
             (cid,),
         )
         analyses = await a.fetchall()
+        iv = await db.execute(
+            "SELECT id, created_at, log_json, report_json FROM interviews WHERE candidate_id=? ORDER BY id DESC LIMIT 1",
+            (cid,),
+        )
+        last_iv = await iv.fetchone()
 
     candidate = dict(candidate)
     analyses = [dict(x) for x in analyses]
@@ -410,12 +675,28 @@ async def candidate_detail(request: Request, cid: int):
         it["resume_html"] = _build_highlighted_resume(
             candidate.get("raw_resume_text") or "", ann
         )
+    # prepare last interview content
+    last_interview = None
+    if last_iv:
+        try:
+            lj = last_iv["log_json"]
+            rj = last_iv["report_json"]
+            last_interview = {
+                "id": last_iv["id"],
+                "created_at": last_iv["created_at"],
+                "log": json.loads(lj) if lj else None,
+                "report": json.loads(rj) if rj else None,
+            }
+        except Exception:
+            last_interview = {"id": last_iv["id"], "created_at": last_iv["created_at"], "log": None, "report": None}
+
     return templates.TemplateResponse(
         "candidate.html",
         {
             "request": request,
             "c": candidate,
             "analyses": analyses,
+            "last_interview": last_interview,
             "STATUS_CHOICES": STATUS_CHOICES,
             "status_label": status_label(candidate.get("candidate_status")),
             "call_base_url": CALL_BASE_URL,
@@ -450,6 +731,7 @@ async def delete_candidate(cid: int):
 async def stats(request: Request):
     import json as _json
     import re as _re
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         # распределение статусов
@@ -527,7 +809,9 @@ async def stats(request: Request):
             pass
         if not chosen:
             s = (r.get("summary") or "").strip()
-            m = _re.search(r"ваканси[ие]\s+['\"]([^'\"]+)['\"]", s, flags=_re.IGNORECASE)
+            m = _re.search(
+                r"ваканси[ие]\s+['\"]([^'\"]+)['\"]", s, flags=_re.IGNORECASE
+            )
             if m:
                 chosen = m.group(1).strip()
         chosen = chosen or "—"
@@ -647,7 +931,9 @@ async def requirements_delete(filename: str = Form(...)):
 
 
 @app.post("/candidates/upload")
-async def candidates_upload(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
+async def candidates_upload(
+    background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)
+):
     job_sets = _load_all_job_sets()
     if not job_sets:
         return RedirectResponse(url="/requirements", status_code=303)
@@ -672,43 +958,85 @@ async def candidates_upload(background_tasks: BackgroundTasks, files: List[Uploa
         # create pending candidate and enqueue background analysis
         try:
             from db import create_candidate_pending, save_analysis_for_candidate
-            candidate_id = await create_candidate_pending(resume_path=dest, raw_resume_text=resume_text)
+
+            candidate_id = await create_candidate_pending(
+                resume_path=dest, raw_resume_text=resume_text
+            )
         except Exception:
             continue
 
         async def _bg_analyze_and_store(cid: int, text: str, sets: list[dict]):
             try:
                 import asyncio as _asyncio
-                from db import acquire_agent_lock, release_agent_lock, save_analysis_for_candidate
+                from db import (
+                    acquire_agent_lock,
+                    release_agent_lock,
+                    save_analysis_for_candidate,
+                )
+
                 # очередь: один агент обрабатывает по очереди
-                locked = await acquire_agent_lock("screening_agent", timeout_sec=1800, poll_sec=0.5)
+                locked = await acquire_agent_lock(
+                    "screening_agent", timeout_sec=1800, poll_sec=0.5
+                )
                 if not locked:
                     return
                 loop = _asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, lambda: agent.analyze_and_questions(text, sets))
+                result = await loop.run_in_executor(
+                    None, lambda: agent.analyze_and_questions(text, sets)
+                )
                 # parse
                 avg_score: int | None = None
                 summary = ""
                 try:
-                    if isinstance(result, dict) and isinstance(result.get("Анализ"), dict):
+                    if isinstance(result, dict) and isinstance(
+                        result.get("Анализ"), dict
+                    ):
                         avg_score = int(result["Анализ"].get("Средняя оценка"))
                         summary = str(result["Анализ"].get("Общий вывод", ""))
                 except Exception:
                     pass
-                status = (result.get("Статус") or {}) if isinstance(result, dict) else {}
+                status = (
+                    (result.get("Статус") or {}) if isinstance(result, dict) else {}
+                )
                 is_resume = bool(status.get("Это резюме", True))
                 await save_analysis_for_candidate(
                     candidate_id=cid,
                     avg_score=avg_score if isinstance(avg_score, int) else -1,
-                    verdict=("positive" if (isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD) else "negative"),
+                    verdict=(
+                        "positive"
+                        if (
+                            isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD
+                        )
+                        else "negative"
+                    ),
                     summary=summary or "—",
                     raw_json=result,
                     is_resume=is_resume,
-                    full_name=(result.get("Кандидат", {}) or {}).get("ФИО") if isinstance(result, dict) else None,
-                    age=(result.get("Кандидат", {}) or {}).get("Возраст") if isinstance(result, dict) else None,
-                    gender=(result.get("Кандидат", {}) or {}).get("Пол") if isinstance(result, dict) else None,
-                    phone=(result.get("Кандидат", {}) or {}).get("Телефон") if isinstance(result, dict) else None,
-                    address=(result.get("Кандидат", {}) or {}).get("Адрес") if isinstance(result, dict) else None,
+                    full_name=(
+                        (result.get("Кандидат", {}) or {}).get("ФИО")
+                        if isinstance(result, dict)
+                        else None
+                    ),
+                    age=(
+                        (result.get("Кандидат", {}) or {}).get("Возраст")
+                        if isinstance(result, dict)
+                        else None
+                    ),
+                    gender=(
+                        (result.get("Кандидат", {}) or {}).get("Пол")
+                        if isinstance(result, dict)
+                        else None
+                    ),
+                    phone=(
+                        (result.get("Кандидат", {}) or {}).get("Телефон")
+                        if isinstance(result, dict)
+                        else None
+                    ),
+                    address=(
+                        (result.get("Кандидат", {}) or {}).get("Адрес")
+                        if isinstance(result, dict)
+                        else None
+                    ),
                 )
             except Exception:
                 pass
@@ -718,10 +1046,14 @@ async def candidates_upload(background_tasks: BackgroundTasks, files: List[Uploa
                 except Exception:
                     pass
 
-        background_tasks.add_task(_bg_analyze_and_store, candidate_id, resume_text, job_sets)
+        background_tasks.add_task(
+            _bg_analyze_and_store, candidate_id, resume_text, job_sets
+        )
         saved_any = True
 
     return RedirectResponse(url="/", status_code=303)
+
+
 def _load_all_job_sets():
     paths = set(parse_job_paths_env(JOB_DESCRIPTION_PATHS))
     for p in parse_job_paths_env(JOB_DESCRIPTION_PATH_LEGACY):
@@ -740,28 +1072,103 @@ async def call_page(request: Request, cid: int):
 @app.post("/webrtc/offer/{cid}")
 async def webrtc_offer(cid: int, payload: dict):
     import uuid, asyncio
+
     offer = RTCSessionDescription(sdp=payload.get("sdp"), type=payload.get("type"))
     pc = RTCPeerConnection(RTC_CONF)
     pid = f"{cid}-{uuid.uuid4()}"
     peers[pid] = pc
+    peers_by_cid.setdefault(cid, set()).add(pc)
     recorder = MediaBlackhole()
 
     @pc.on("track")
     async def on_track(track):
         # Attach handlers for inbound audio/video to verify we receive media
+        sess = await _get_or_create_session(cid)
         if track.kind == "audio":
             local_audio = relay.subscribe(track)
+
             async def read_audio():
                 while True:
                     try:
                         frame = await local_audio.recv()
-                        # TODO: plug ASR here later
+                        # convert to mono float32 numpy
+                        import numpy as _np
+
+                        samples = frame.to_ndarray()
+                        # shape could be (channels, samples) or (samples,)
+                        if samples.ndim == 2:
+                            # average channels
+                            mono = samples.mean(axis=0)
+                        else:
+                            mono = samples
+                        # normalize to [-1,1] float32 if int16
+                        if mono.dtype != _np.float32:
+                            # assume int16
+                            mono = mono.astype(_np.float32) / 32768.0
+                        # resample to 16k from frame.sample_rate
+                        sr = getattr(frame, "sample_rate", 48000) or 48000
+                        audio16k = _resample_to_16k(mono, sr)
+                        # accumulate ~1s window like CLI before VAD
+                        if 'sec_buf' not in read_audio.__dict__:
+                            read_audio.sec_buf = []
+                            read_audio.sec_len = 0
+                        read_audio.sec_buf.append(audio16k)
+                        read_audio.sec_len += audio16k.size
+                        if read_audio.sec_len < SAMPLERATE * CHUNK_SEC:
+                            continue
+                        # build 1-second chunk
+                        sec_chunk = _np.concatenate(read_audio.sec_buf)
+                        read_audio.sec_buf = []
+                        read_audio.sec_len = 0
+
+                        use_silero = (vad_model is not None)
+                        # базовый RMS как резерв — более строгий, чем раньше (по умолчанию 0.01)
+                        rms_val = float(_np.sqrt(_np.mean(sec_chunk * sec_chunk)))
+                        has_speech_rms = rms_val > RMS_GATE
+                        has_speech_silero = False
+                        if use_silero:
+                            try:
+                                x = torch.tensor(sec_chunk, dtype=torch.float32, device=_VAD_DEVICE)
+                                ts = get_speech_timestamps(x, vad_model, sampling_rate=SAMPLERATE)
+                                has_speech_silero = len(ts) > 0
+                            except Exception:
+                                has_speech_silero = False
+                        # комбинированное решение: Silero ИЛИ RMS-порог
+                        has_speech = has_speech_silero or has_speech_rms
+
+                        if DEBUG_VAD:
+                            try:
+                                await _ws_broadcast(sess, {"role": "system", "text": f"VAD 1s: rms={rms_val:.4f} has_speech={has_speech} (silero={has_speech_silero}, rms_gate={has_speech_rms})"})
+                            except Exception:
+                                pass
+
+                        if has_speech:
+                            sess.audio_buffer.append(sec_chunk)
+                            sess.silent_chunks = 0
+                        else:
+                            sess.silent_chunks += 1
+                        # when we had speech and now enough silence, process
+                        if sess.silent_chunks >= PAUSE_CHUNKS and sess.audio_buffer:
+                            chunk = _np.concatenate(sess.audio_buffer)
+                            sess.audio_buffer.clear()
+                            sess.silent_chunks = 0
+                            if DEBUG_VAD:
+                                try:
+                                    rms_chunk = float(_np.sqrt(_np.mean(chunk * chunk)))
+                                    dur = chunk.size / SAMPLERATE
+                                    await _ws_broadcast(sess, {"role": "system", "text": f"🎙️ сегмент {dur:.2f}s, rms={rms_chunk:.4f} → ASR"})
+                                except Exception:
+                                    pass
+                            await _transcribe_and_reply(sess, chunk)
                     except Exception:
                         # MediaStreamError is raised when stream ends; exit loop quietly
                         break
+
             audio_task = asyncio.create_task(read_audio())
+            sess.tasks.add(audio_task)
         elif track.kind == "video":
             local_video = relay.subscribe(track)
+
             async def read_video():
                 while True:
                     try:
@@ -769,7 +1176,9 @@ async def webrtc_offer(cid: int, payload: dict):
                         # TODO: plug video processing here later
                     except Exception:
                         break
+
             video_task = asyncio.create_task(read_video())
+            sess.tasks.add(video_task)
         await recorder.start()
 
         @track.on("ended")
@@ -777,10 +1186,12 @@ async def webrtc_offer(cid: int, payload: dict):
             await recorder.stop()
             # cancel reader tasks if any
             try:
-                if track.kind == "audio" and 'audio_task' in locals():
-                    audio_task.cancel()
-                if track.kind == "video" and 'video_task' in locals():
-                    video_task.cancel()
+                for t in list(sess.tasks):
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                sess.tasks.clear()
             except Exception:
                 pass
 

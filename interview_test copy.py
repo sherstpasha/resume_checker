@@ -10,22 +10,22 @@ from dotenv import load_dotenv
 from silero_vad import load_silero_vad, get_speech_timestamps
 from utils import extract_text, load_job_requirements
 from agents.resume_analyzer import ResumeAnalyzerAgent
-from agents.interviewer import HRInterviewerAgent  # <-- ваш класс из кода
+from agents.interviewer import HRInterviewerAgent
 
 # ============================ КОНФИГ ============================
 
 # Укажи путь к файлу резюме:
-RESUME_PATH = r"C:\Users\USER\Desktop\ML_Engineer_Шерстнев_Павел.pdf"   # <<< замените на свой путь
+RESUME_PATH = r"C:\Users\pasha\Downloads\Telegram Desktop\ML_Engineer_Шерстнев_Павел (2).pdf"  # <<< замените на свой путь
 
-STOP_WORDS   = ["стоп", "закончим", "хватит", "достаточно", "завершим"]
+STOP_WORDS = ["стоп", "закончим", "хватит", "достаточно", "завершим"]
 
 load_dotenv()
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8080/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME", "llama-2-7b-chat")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-2-7b-chat")
 JOB_DESCRIPTION_PATH = os.getenv("JOB_DESCRIPTION_PATH")
 
-SAMPLERATE   = 16000
-CHUNK_SEC    = 1
+SAMPLERATE = 16000
+CHUNK_SEC = 1
 PAUSE_CHUNKS = 2
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -37,6 +37,7 @@ print("⏳ Инициализация VAD...")
 vad_model = load_silero_vad(onnx=False)
 _VAD_DEVICE = "cpu"
 
+
 def vad_listen_loop(interviewer: HRInterviewerAgent):
     """Слушаем микрофон кусками, отслеживаем паузы VAD,
     при паузе — склеиваем и распознаём через interviewer.stt_model."""
@@ -47,7 +48,12 @@ def vad_listen_loop(interviewer: HRInterviewerAgent):
 
     while not interviewer.finished:
         # записываем очередной фрейм
-        audio = sd.rec(int(SAMPLERATE * CHUNK_SEC), samplerate=SAMPLERATE, channels=1, dtype="float32")
+        audio = sd.rec(
+            int(SAMPLERATE * CHUNK_SEC),
+            samplerate=SAMPLERATE,
+            channels=1,
+            dtype="float32",
+        )
         sd.wait()
         audio = audio.flatten()
 
@@ -67,7 +73,9 @@ def vad_listen_loop(interviewer: HRInterviewerAgent):
                     chunk = chunk / np.max(np.abs(chunk))
 
                 # распознаём через STT из агента (у него уже есть stt_model)
-                result = interviewer.stt_model.transcribe(chunk, language="ru", fp16=(DEVICE == "cuda"))
+                result = interviewer.stt_model.transcribe(
+                    chunk, language="ru", fp16=(DEVICE == "cuda")
+                )
                 user_text = result["text"].strip()
                 if not user_text:
                     continue
@@ -92,6 +100,7 @@ def vad_listen_loop(interviewer: HRInterviewerAgent):
 
     print("⏹ Собеседование остановлено.")
 
+
 def main():
     # 1) проверяем резюме и вытаскиваем текст
     if not RESUME_PATH or not os.path.exists(RESUME_PATH):
@@ -112,7 +121,7 @@ def main():
     analyzer = ResumeAnalyzerAgent(API_BASE_URL, MODEL_NAME)
     result = analyzer.analyze_and_questions(resume_text, job_requirements)
 
-    analysis  = result.get("Анализ", {})
+    analysis = result.get("Анализ", {})
     questions = result.get("Вопросы", [])
 
     print("\n📊 Результаты анализа:")
@@ -127,7 +136,7 @@ def main():
         model_name=MODEL_NAME,
         analysis=analysis,
         questions=questions,
-        device=DEVICE
+        device=DEVICE,
     )
 
     # 5) голосовой цикл с VAD → Whisper → reply → TTS
@@ -144,6 +153,7 @@ def main():
         print("\n📝 Заметки интервьюера:")
         for n in notes:
             print("-", n)
+
 
 if __name__ == "__main__":
     main()

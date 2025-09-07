@@ -15,11 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import tempfile
 from silero_vad import load_silero_vad, get_speech_timestamps
-from utils import (
-    extract_text,
-    load_job_requirements,
-    strip_thinking_tags
-)
+from utils import extract_text, load_job_requirements, strip_thinking_tags
 import json
 from utils import FallbackTTS
 from agents.resume_analyzer import ResumeAnalyzerAgent
@@ -31,12 +27,12 @@ STOP_WORDS = ["стоп", "закончим", "хватит", "достаточ�
 
 load_dotenv()
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8080/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME", "llama-2-7b-chat")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-2-7b-chat")
 JOB_DESCRIPTION_PATH = os.getenv("JOB_DESCRIPTION_PATH")
 resume_agent = ResumeAnalyzerAgent(API_BASE_URL, MODEL_NAME)
 
-SAMPLERATE   = 16000
-CHUNK_SEC    = 1
+SAMPLERATE = 16000
+CHUNK_SEC = 1
 PAUSE_CHUNKS = 2
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,10 +62,12 @@ tts = FallbackTTS()
 
 # ============================ Утилиты ============================
 
+
 def log_line(text: str):
     with _lock:
         print(text)
         _log.append(text)
+
 
 def check_end_dialogue(user_text: str, assistant_text: str) -> bool:
     try:
@@ -92,7 +90,10 @@ def check_end_dialogue(user_text: str, assistant_text: str) -> bool:
 Реплика интервьюера:
 {assistant_text}
 """
-        payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}]}
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+        }
         r = requests.post(f"{API_BASE_URL}/chat/completions", json=payload, timeout=30)
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"]
@@ -117,7 +118,7 @@ def ask_llm(user_text: str) -> str:
         payload = {
             "model": MODEL_NAME,
             "messages": _dialogue_history,
-            "temperature": 0.4
+            "temperature": 0.4,
         }
         r = requests.post(f"{API_BASE_URL}/chat/completions", json=payload, timeout=60)
         r.raise_for_status()
@@ -132,7 +133,7 @@ def ask_llm(user_text: str) -> str:
         # проверка окончания интервью
         if check_end_dialogue(user_text, clean):
             log_line("📊 Модель классификатор решила: интервью закончено.")
-            
+
             # генерируем финальный отчёт
             prompt_report = """
             На основе всего собеседования и анализа кандидата 
@@ -146,11 +147,16 @@ def ask_llm(user_text: str) -> str:
               "Общий вывод": "текстовое заключение"
             }
             """
-            payload = {"model": MODEL_NAME, "messages": [
-                {"role": "system", "content": _system_prompt},
-                {"role": "user", "content": prompt_report}
-            ]}
-            r = requests.post(f"{API_BASE_URL}/chat/completions", json=payload, timeout=60)
+            payload = {
+                "model": MODEL_NAME,
+                "messages": [
+                    {"role": "system", "content": _system_prompt},
+                    {"role": "user", "content": prompt_report},
+                ],
+            }
+            r = requests.post(
+                f"{API_BASE_URL}/chat/completions", json=payload, timeout=60
+            )
             r.raise_for_status()
             report_raw = r.json()["choices"][0]["message"]["content"]
 
@@ -166,7 +172,10 @@ def ask_llm(user_text: str) -> str:
     except Exception as e:
         log_line(f"⚠️ Ошибка ask_llm: {e}")
         return "Извините, произошла ошибка при обработке ответа."
+
+
 # ============================ Логика интервью ============================
+
 
 def interview_loop():
     global _interview_running, _speaking
@@ -183,7 +192,12 @@ def interview_loop():
             time.sleep(0.05)
             continue
 
-        audio = sd.rec(int(SAMPLERATE * CHUNK_SEC), samplerate=SAMPLERATE, channels=1, dtype="float32")
+        audio = sd.rec(
+            int(SAMPLERATE * CHUNK_SEC),
+            samplerate=SAMPLERATE,
+            channels=1,
+            dtype="float32",
+        )
         sd.wait()
         audio = audio.flatten()
 
@@ -197,7 +211,9 @@ def interview_loop():
                 if np.max(np.abs(chunk)) > 0:
                     chunk = chunk / np.max(np.abs(chunk))
 
-                result = stt_model.transcribe(chunk, language="ru", fp16=(DEVICE == "cuda"))
+                result = stt_model.transcribe(
+                    chunk, language="ru", fp16=(DEVICE == "cuda")
+                )
                 user_text = result["text"].strip()
                 log_line(f"👤 Пользователь: {user_text}")
 
@@ -220,13 +236,17 @@ def interview_loop():
 
     log_line("⏹ Собеседование остановлено.")
 
+
 # ============================ Роуты ============================
+
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+
 JOB_REQUIREMENTS = load_job_requirements(JOB_DESCRIPTION_PATH)
+
 
 @app.post("/api/upload_resume")
 async def upload_resume(file: UploadFile = File(...)):
@@ -242,8 +262,7 @@ async def upload_resume(file: UploadFile = File(...)):
         resume_text = extract_text(save_path)
         if not resume_text.strip():
             return JSONResponse(
-                {"error": "Не удалось извлечь текст из файла."},
-                status_code=400
+                {"error": "Не удалось извлечь текст из файла."}, status_code=400
             )
 
         # --- анализ резюме и генерация вопросов через агента ---
@@ -270,19 +289,19 @@ async def upload_resume(file: UploadFile = File(...)):
   чтобы синтезатор речи произнёс их правильно. Пример: "TensorFlow" → "Тéнсорфлоу", "PyTorch" → "Пайтóрч".
 """
 
-        return JSONResponse({
-            "analysis": analysis,
-            "questions": questions
-        })
+        return JSONResponse({"analysis": analysis, "questions": questions})
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 @app.post("/api/start")
 def api_start():
     global _interview_running, _log, _system_prompt, _dialogue_history
     if not _system_prompt:
-        return JSONResponse({"status": "error", "message": "Сначала загрузите резюме"}, status_code=400)
+        return JSONResponse(
+            {"status": "error", "message": "Сначала загрузите резюме"}, status_code=400
+        )
 
     with _lock:
         if not _interview_running:
@@ -293,6 +312,7 @@ def api_start():
             return JSONResponse({"status": "started"})
     return JSONResponse({"status": "already running"})
 
+
 @app.post("/api/stop")
 def api_stop():
     global _interview_running
@@ -300,14 +320,17 @@ def api_stop():
         _interview_running = False
     return JSONResponse({"status": "stopped"})
 
+
 @app.get("/api/speaking")
 def api_speaking():
     return JSONResponse({"speaking": _speaking})
+
 
 @app.get("/api/logs")
 def api_logs():
     with _lock:
         return JSONResponse({"dialogue": "\n".join(_log)})
+
 
 # ============================ Запуск ============================
 

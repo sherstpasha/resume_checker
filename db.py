@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS tg_logs (
 CREATE TABLE IF NOT EXISTS agent_locks (
   name TEXT PRIMARY KEY
 );
+
+-- История интервью (листинг беседы и финальный отчёт)
+CREATE TABLE IF NOT EXISTS interviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  candidate_id INTEGER,
+  log_json TEXT,      -- массив {role,text}
+  report_json TEXT,   -- финальный отчёт JSON
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+);
 """
 
 
@@ -256,6 +266,22 @@ async def release_agent_lock(name: str = "global") -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM agent_locks WHERE name=?", (name,))
         await db.commit()
+
+
+async def save_interview(candidate_id: int, log: list | dict | str | None, report: dict | list | str | None) -> int:
+    """Сохраняет интервью (листинг + отчёт). Возвращает interview_id."""
+    import json as _json
+    if isinstance(log, (dict, list)):
+        log = _json.dumps(log, ensure_ascii=False)
+    if isinstance(report, (dict, list)):
+        report = _json.dumps(report, ensure_ascii=False)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO interviews(candidate_id,log_json,report_json) VALUES (?,?,?)",
+            (candidate_id, log or None, report or None),
+        )
+        await db.commit()
+        return int(cur.lastrowid)
 
 
 async def log_event(

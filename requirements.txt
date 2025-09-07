@@ -33,7 +33,8 @@ omegaconf
 edge_tts
 simpleaudio
 pygame
-
+sounddevice
+silero_vad
 aiogram==3.13.1
 pydantic==2.8.2
 pydantic-settings==2.3.4

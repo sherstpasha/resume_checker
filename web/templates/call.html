@@ -16,6 +16,12 @@
     <button class="btn" id="videoToggle" disabled>Камера: выкл</button>
     <span id="status" class="muted"></span>
   </div>
+  <div class="vu-wrap" id="vuWrap" style="display:none">
+    <div class="vu-bar"><div class="vu-fill" id="vuFill" style="width:0%"></div></div>
+  </div>
+  <div id="chat" class="card" style="max-width:960px;">
+    <div id="log" style="min-height:120px; max-height:220px; overflow:auto;"></div>
+  </div>
   <div class="muted">Дайте доступ к микрофону и (по желанию) к камере.</div>
   <input type="hidden" id="cid" value="{{ cid }}">
 </div>
@@ -26,6 +32,19 @@
   async function join() {
     try {
       const cid = document.getElementById('cid').value;
+      // websocket for transcripts/replies
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + `/call/ws/${cid}`);
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          const log = document.getElementById('log');
+          const div = document.createElement('div');
+          div.className = msg.role === 'assistant' ? 'msg assistant' : (msg.role === 'user' ? 'msg user' : 'msg sys');
+          div.textContent = (msg.role === 'assistant' ? '🤖 ' : (msg.role === 'user' ? '👤 ' : 'ℹ️ ')) + (msg.text || '');
+          log.appendChild(div);
+          log.scrollTop = log.scrollHeight;
+        } catch {}
+      };
       pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
 
       // remote
@@ -66,6 +85,42 @@
       micBtn.onclick = () => { if (audioTrack) { audioTrack.enabled = !audioTrack.enabled; updateMic(); } };
       updateMic();
 
+      // VU meter (Web Audio API)
+      try {
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks && audioTracks.length) {
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const src = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 2048;
+          const data = new Float32Array(analyser.fftSize);
+          src.connect(analyser);
+          const wrap = document.getElementById('vuWrap');
+          const fill = document.getElementById('vuFill');
+          wrap.style.display = '';
+          let rafId;
+          const render = () => {
+            analyser.getFloatTimeDomainData(data);
+            // RMS
+            let sum = 0;
+            for (let i = 0; i < data.length; i++) { const v = data[i]; sum += v*v; }
+            const rms = Math.sqrt(sum / data.length);
+            const pct = Math.min(100, Math.max(0, Math.round(rms * 300))); // ~0.33 -> 100%
+            fill.style.width = pct + '%';
+            if (pct > 12) { fill.classList.add('on'); } else { fill.classList.remove('on'); }
+            rafId = requestAnimationFrame(render);
+          };
+          render();
+          // stop meter on leave
+          document.getElementById('leaveBtn').addEventListener('click', () => {
+            try { cancelAnimationFrame(rafId); ctx.close(); } catch(_) {}
+            wrap.style.display = 'none';
+          }, { once: true });
+        }
+      } catch(e) {
+        // ignore VU errors
+      }
+
       // video toggle (show placeholder when off)
       const videoBtn = document.getElementById('videoToggle');
       const videoTrack = stream.getVideoTracks()[0] || null;
@@ -101,6 +156,9 @@
 
   function leave() {
     try {
+      const cid = document.getElementById('cid').value;
+      // notify server to finish interview
+      fetch(`/call/finish/${cid}`, { method: 'POST' }).catch(()=>{});
       if (pc) {
         pc.getSenders().forEach(s => s.track && s.track.stop());
         pc.close();
