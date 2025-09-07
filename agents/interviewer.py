@@ -8,7 +8,14 @@ import numpy as np
 
 
 class HRInterviewerAgent:
-    def __init__(self, api_base_url: str, model_name: str, analysis: dict, questions: list[str], device="cpu"):
+    def __init__(
+        self,
+        api_base_url: str,
+        model_name: str,
+        analysis: dict,
+        questions: list[str],
+        device="cpu",
+    ):
         """
         analysis: dict с результатами ResumeAnalyzerAgent
         questions: список заранее подготовленных вопросов
