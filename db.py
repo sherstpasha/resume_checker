@@ -52,13 +52,17 @@ CREATE TABLE IF NOT EXISTS tg_logs (
 );
 """
 
+
 async def init_db(db_path: str | None = None):
     path = db_path or DB_PATH
     async with aiosqlite.connect(path) as db:
         await db.executescript(SCHEMA)
         await db.commit()
 
-async def upsert_recruiter(tg_user_id: int, tg_chat_id: int, name: str | None = None) -> int:
+
+async def upsert_recruiter(
+    tg_user_id: int, tg_chat_id: int, name: str | None = None
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO recruiters(tg_user_id,tg_chat_id,name) VALUES(?,?,?) "
@@ -66,9 +70,12 @@ async def upsert_recruiter(tg_user_id: int, tg_chat_id: int, name: str | None = 
             (tg_user_id, tg_chat_id, name),
         )
         await db.commit()
-        cur = await db.execute("SELECT id FROM recruiters WHERE tg_user_id=?", (tg_user_id,))
+        cur = await db.execute(
+            "SELECT id FROM recruiters WHERE tg_user_id=?", (tg_user_id,)
+        )
         row = await cur.fetchone()
         return int(row[0])
+
 
 async def create_candidate_and_analysis(
     *,
@@ -91,14 +98,27 @@ async def create_candidate_and_analysis(
         raw_json = json.dumps(raw_json, ensure_ascii=False)
 
     thr = int(os.getenv("RESUME_THRASH", "75"))
-    auto_status = "screen_passed" if (is_resume and isinstance(avg_score, int) and avg_score >= thr) else "screen_failed"
+    auto_status = (
+        "screen_passed"
+        if (is_resume and isinstance(avg_score, int) and avg_score >= thr)
+        else "screen_failed"
+    )
 
     async with aiosqlite.connect(DB_PATH) as db:
         # candidate
         cur = await db.execute(
             "INSERT INTO candidates(full_name,age,gender,phone,address,resume_path,raw_resume_text,candidate_status) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            (full_name, age, gender, phone, address, resume_path, (raw_resume_text or "")[:50000], auto_status),
+            (
+                full_name,
+                age,
+                gender,
+                phone,
+                address,
+                resume_path,
+                (raw_resume_text or "")[:50000],
+                auto_status,
+            ),
         )
         await db.commit()
         candidate_id = cur.lastrowid
@@ -121,12 +141,19 @@ async def create_candidate_and_analysis(
 
         return candidate_id, analysis_id
 
-async def log_event(chat_id: int | None, user_id: int | None, username: str | None, event: str, payload: str | dict | None = None):
+
+async def log_event(
+    chat_id: int | None,
+    user_id: int | None,
+    username: str | None,
+    event: str,
+    payload: str | dict | None = None,
+):
     if isinstance(payload, (dict, list)):
         payload = json.dumps(payload, ensure_ascii=False)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO tg_logs(chat_id,user_id,username,event,payload) VALUES (?,?,?,?,?)",
-            (chat_id, user_id, username, event, payload)
+            (chat_id, user_id, username, event, payload),
         )
         await db.commit()

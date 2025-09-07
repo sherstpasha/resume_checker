@@ -1,11 +1,14 @@
 import os
 import aiosqlite
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from typing import List
 
 DB_PATH = os.getenv("DB_PATH", "./hr_bot.sqlite3")
+REQ_DIR = os.getenv("JOB_REQUIREMENTS_DIR", "./requirements")
+os.makedirs(REQ_DIR, exist_ok=True)
 
 app = FastAPI(title="HR Resume Bot — Admin")
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
@@ -135,3 +138,59 @@ async def logs(request: Request, limit: int = 200):
         cur = await db.execute("SELECT * FROM tg_logs ORDER BY id DESC LIMIT ?", (min(limit, 1000),))
         rows = [dict(r) for r in await cur.fetchall()]
     return templates.TemplateResponse("logs.html", {"request": request, "rows": rows})
+
+
+# --------- Requirements management ---------
+SUPPORTED_REQ_EXTS = {".pdf", ".docx", ".txt", ".doc", ".rtf", ".odt"}
+
+
+def _list_requirements():
+    files = []
+    try:
+        for name in os.listdir(REQ_DIR):
+            full = os.path.join(REQ_DIR, name)
+            if os.path.isfile(full):
+                files.append(name)
+    except Exception:
+        pass
+    files.sort()
+    return files
+
+
+@app.get("/requirements", response_class=HTMLResponse)
+async def requirements_page(request: Request):
+    files = _list_requirements()
+    return templates.TemplateResponse(
+        "requirements.html",
+        {"request": request, "files": files, "req_dir": REQ_DIR, "exts": ", ".join(sorted(SUPPORTED_REQ_EXTS))},
+    )
+
+
+@app.post("/requirements/upload")
+async def requirements_upload(files: List[UploadFile] = File(...)):
+    for uf in files:
+        name = os.path.basename(uf.filename or "")
+        if not name:
+            continue
+        _, ext = os.path.splitext(name)
+        if ext.lower() not in SUPPORTED_REQ_EXTS:
+            continue
+        dest = os.path.join(REQ_DIR, name)
+        # overwrite allowed
+        content = await uf.read()
+        with open(dest, "wb") as f:
+            f.write(content)
+    return RedirectResponse(url="/requirements", status_code=303)
+
+
+@app.post("/requirements/delete")
+async def requirements_delete(filename: str = Form(...)):
+    # prevent path traversal
+    name = os.path.basename(filename)
+    target = os.path.join(REQ_DIR, name)
+    if os.path.isfile(target):
+        try:
+            os.remove(target)
+        except Exception:
+            pass
+    return RedirectResponse(url="/requirements", status_code=303)

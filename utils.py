@@ -37,8 +37,12 @@ def sanitize_ssml_for_silero(ssml: str) -> str:
     ssml = re.sub(r"</?\s*s\s*>", "", ssml, flags=re.IGNORECASE)
 
     # break → [[pause]]
-    ssml = re.sub(r"<\s*break\s+time\s*=\s*\"([0-9]+)ms\"\s*/?\s*>",
-                  r'[[pause \1 ms]]', ssml, flags=re.IGNORECASE)
+    ssml = re.sub(
+        r"<\s*break\s+time\s*=\s*\"([0-9]+)ms\"\s*/?\s*>",
+        r"[[pause \1 ms]]",
+        ssml,
+        flags=re.IGNORECASE,
+    )
 
     # prosody → speed/pitch
     def _prosody_to_silero(m):
@@ -48,20 +52,36 @@ def sanitize_ssml_for_silero(ssml: str) -> str:
         pre, post = "", ""
         if rate:
             r = rate.group(1)
-            if r in ("x-slow", "slow"): pre += "[[speed 80%]]"; post = "[[/speed]]" + post
-            if r in ("fast", "x-fast"): pre += "[[speed 120%]]"; post = "[[/speed]]" + post
+            if r in ("x-slow", "slow"):
+                pre += "[[speed 80%]]"
+                post = "[[/speed]]" + post
+            if r in ("fast", "x-fast"):
+                pre += "[[speed 120%]]"
+                post = "[[/speed]]" + post
         if pitch:
             p = pitch.group(1)
-            if p in ("low", "x-low"): pre += "[[pitch -20%]]"; post = "[[/pitch]]" + post
-            if p in ("high", "x-high"): pre += "[[pitch +20%]]"; post = "[[/pitch]]" + post
+            if p in ("low", "x-low"):
+                pre += "[[pitch -20%]]"
+                post = "[[/pitch]]" + post
+            if p in ("high", "x-high"):
+                pre += "[[pitch +20%]]"
+                post = "[[/pitch]]" + post
         return pre + inner + post
 
-    ssml = re.sub(r"<\s*prosody([^>]*)>(.*?)</\s*prosody\s*>",
-                  _prosody_to_silero, ssml, flags=re.DOTALL|re.IGNORECASE)
+    ssml = re.sub(
+        r"<\s*prosody([^>]*)>(.*?)</\s*prosody\s*>",
+        _prosody_to_silero,
+        ssml,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
     # emphasis → CAPS
-    ssml = re.sub(r"<\s*emphasis\s*>(.*?)</\s*emphasis\s*>",
-                  lambda m: m.group(1).upper(), ssml, flags=re.IGNORECASE)
+    ssml = re.sub(
+        r"<\s*emphasis\s*>(.*?)</\s*emphasis\s*>",
+        lambda m: m.group(1).upper(),
+        ssml,
+        flags=re.IGNORECASE,
+    )
 
     # speak → убираем
     ssml = re.sub(r"</?\s*speak\s*>", "", ssml, flags=re.IGNORECASE)
@@ -75,6 +95,7 @@ def ssml_to_plain_text(ssml: str) -> str:
     ssml = re.sub(r"\s+", " ", ssml).strip()
     return ssml
 
+
 # ---------- Парсеры файлов ----------
 def extract_text_from_pdf(path):
     text = ""
@@ -83,6 +104,7 @@ def extract_text_from_pdf(path):
         if page.extract_text():
             text += page.extract_text() + "\n"
     return text.strip()
+
 
 def extract_text_from_docx(path):
     texts = []
@@ -93,7 +115,9 @@ def extract_text_from_docx(path):
                 texts.append(p.text.strip())
         for table in doc.tables:
             for row in table.rows:
-                row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                row_text = [
+                    cell.text.strip() for cell in row.cells if cell.text.strip()
+                ]
                 if row_text:
                     texts.append(" | ".join(row_text))
         content = "\n".join(texts).strip()
@@ -107,9 +131,11 @@ def extract_text_from_docx(path):
     except Exception:
         return ""
 
+
 def extract_text_from_txt(path):
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
+
 
 def extract_text_from_doc_or_rtf(path):
     try:
@@ -117,6 +143,7 @@ def extract_text_from_doc_or_rtf(path):
         return text.decode("utf-8", errors="ignore")
     except Exception:
         return ""
+
 
 def extract_text(file_path):
     ext = file_path.lower()
@@ -130,6 +157,7 @@ def extract_text(file_path):
         return extract_text_from_doc_or_rtf(file_path)
     else:
         return ""
+
 
 # ---------- Загрузка требований ----------
 def load_job_requirements(path):
@@ -151,6 +179,55 @@ def load_job_requirements(path):
             requirements.append(line.strip())
     return [r for r in requirements if r]
 
+
+def parse_job_paths_env(value: str | None) -> list[str]:
+    import re
+
+    if not value:
+        return []
+    parts = re.split(r"[,\n;]+", value)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def load_job_requirements_many(paths: list[str]) -> list[dict]:
+    """
+    Возвращает список вакансий:
+    [{"id": 1, "name": "<имя из файла>", "path": "<путь>", "requirements": [...]}, ...]
+    Пустые/невалидные файлы игнорируются.
+    """
+    res = []
+    for p in paths or []:
+        try:
+            reqs = load_job_requirements(p)
+        except Exception:
+            reqs = []
+        if reqs:
+            base = os.path.basename(p)
+            name = os.path.splitext(base)[0]
+            res.append(
+                {"id": len(res) + 1, "name": name, "path": p, "requirements": reqs}
+            )
+    return res
+
+
+SUPPORTED_REQ_EXTS = {".pdf", ".docx", ".txt", ".doc", ".rtf", ".odt"}
+
+
+def list_requirement_files(dir_path: str | None) -> list[str]:
+    """Возвращает список файлов требований в папке (отфильтрованы по расширениям)."""
+    if not dir_path:
+        return []
+    if not os.path.isdir(dir_path):
+        return []
+    files = []
+    for name in os.listdir(dir_path):
+        full = os.path.join(dir_path, name)
+        if not os.path.isfile(full):
+            continue
+        _, ext = os.path.splitext(name)
+        if ext.lower() in SUPPORTED_REQ_EXTS:
+            files.append(full)
+    return sorted(files)
 
 
 # tts_module.py
@@ -175,7 +252,9 @@ class EdgeTTS:
             fd, out_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
 
-        communicate = edge_tts.Communicate(text, self.voice, rate=self.rate, pitch=self.pitch)
+        communicate = edge_tts.Communicate(
+            text, self.voice, rate=self.rate, pitch=self.pitch
+        )
         with open(out_path, "wb") as f:
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
@@ -194,7 +273,9 @@ class EdgeTTS:
 
 class SileroTTS:
     def __init__(self, device=None, speaker="kseniya", sample_rate=48000):
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         self.speaker = speaker
         self.sample_rate = sample_rate
 
@@ -202,7 +283,7 @@ class SileroTTS:
             repo_or_dir="snakers4/silero-models",
             model="silero_tts",
             language="ru",
-            speaker="v4_ru"
+            speaker="v4_ru",
         )
         self.model.to(self.device)
 
@@ -212,9 +293,7 @@ class SileroTTS:
             os.close(fd)
 
         audio = self.model.apply_tts(
-            text=text,
-            speaker=self.speaker,
-            sample_rate=self.sample_rate
+            text=text, speaker=self.speaker, sample_rate=self.sample_rate
         )
         sf.write(out_path, audio, self.sample_rate)
         return out_path
@@ -229,6 +308,7 @@ class SileroTTS:
 
 class FallbackTTS:
     """Сначала EdgeTTS, если ошибка → SileroTTS"""
+
     def __init__(self, **kwargs):
         self.edge = EdgeTTS(
             voice=kwargs.get("voice", "ru-RU-DmitryNeural"),
@@ -243,12 +323,15 @@ class FallbackTTS:
 
     def speak(self, text: str):
         self.silero.speak(text)
+
+
 #        try:
 #            print("🎤 [TTS] EdgeTTS…")
 #            return self.edge.speak(text)
 #        except Exception as e:
 #            print(f"⚠️ EdgeTTS упал ({e}), переключаюсь на Silero.")
 #            return self.silero.speak(text)
+
 
 def extract_json_block(text: str) -> str:
     """
@@ -282,3 +365,33 @@ def parse_json_safely(text: str):
         return json.loads(payload)
     except json.JSONDecodeError as e:
         raise ValueError(f"JSON decode failed: {e}\nExtracted: {payload[:500]}")
+
+
+def parse_job_paths_env(value: str | None) -> list[str]:
+    import re
+
+    if not value:
+        return []
+    parts = re.split(r"[,\n;]+", value)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def load_job_requirements_many(paths: list[str]) -> list[dict]:
+    """
+    Возвращает список вакансий:
+    [{"id": 1, "name": "<имя из файла>", "path": "<путь>", "requirements": [...]}, ...]
+    Пустые/невалидные файлы игнорируются.
+    """
+    res = []
+    for p in paths or []:
+        try:
+            reqs = load_job_requirements(p)
+        except Exception:
+            reqs = []
+        if reqs:
+            base = os.path.basename(p)
+            name = os.path.splitext(base)[0]
+            res.append(
+                {"id": len(res) + 1, "name": name, "path": p, "requirements": reqs}
+            )
+    return res
