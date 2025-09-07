@@ -23,6 +23,10 @@
     </select>
     <button>Обновить статус</button>
   </form>
+
+  <form method="post" action="/candidates/{{ c.id }}/delete" class="inline" onsubmit="return confirm('Удалить кандидата #{{ c.id }} и все связанные анализы? Операция необратима.');">
+    <button class="btn-danger">Удалить кандидата</button>
+  </form>
 </section>
 
 <section>

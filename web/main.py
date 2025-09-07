@@ -7,10 +7,25 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from typing import List
+from dotenv import load_dotenv
+from utils import extract_text, load_job_requirements_many, parse_job_paths_env, list_requirement_files
+from agents.resume_analyzer import ResumeAnalyzerAgent
+from db import create_candidate_and_analysis
+
+# Load .env so env vars are available when running via uvicorn
+load_dotenv()
 
 DB_PATH = os.getenv("DB_PATH", "./hr_bot.sqlite3")
 REQ_DIR = os.getenv("JOB_REQUIREMENTS_DIR", "./requirements")
 os.makedirs(REQ_DIR, exist_ok=True)
+API_BASE_URL = os.getenv("API_BASE_URL")
+MODEL_NAME = os.getenv("MODEL_NAME")
+FILES_DIR = os.getenv("FILES_DIR", "./storage")
+os.makedirs(FILES_DIR, exist_ok=True)
+RESUME_THRASH = os.getenv("RESUME_THRASH")
+RESUME_THRESHOLD = int(RESUME_THRASH) if RESUME_THRASH is not None else int(os.getenv("RESUME_THRESHOLD", "75"))
+JOB_DESCRIPTION_PATHS = os.getenv("JOB_DESCRIPTION_PATHS", "")
+JOB_DESCRIPTION_PATH_LEGACY = os.getenv("JOB_DESCRIPTION_PATH", "")
 
 app = FastAPI(title="HR Resume Bot — Admin")
 app.mount(
@@ -20,6 +35,11 @@ app.mount(
 )
 templates = Jinja2Templates(
     directory=os.path.join(os.path.dirname(__file__), "templates")
+)
+agent = (
+    ResumeAnalyzerAgent(api_base_url=API_BASE_URL, model_name=MODEL_NAME)
+    if (API_BASE_URL and MODEL_NAME)
+    else None
 )
 
 STATUS_CHOICES = [
@@ -192,17 +212,12 @@ def _build_highlighted_resume(text: str, annotations: list[dict] | None) -> str:
                 tone_cls = {"good": "hl-good", "bad": "hl-bad", "warn": "hl-warn"}[
                     sp["tone"]
                 ]
-                title = sp["comment"]
-                if sp["req"]:
-                    title = (sp["req"] + (" — " if sp["comment"] else "")) + sp[
-                        "comment"
-                    ]
                 data_comment = html.escape(sp["comment"]) if sp["comment"] else ""
                 data_req = html.escape(sp["req"]) if sp["req"] else ""
                 data_tone = html.escape(sp["tone"]) if sp["tone"] else ""
                 content = html.escape(line_text[sp["s"] : sp["e"]])
                 parts.append(
-                    f'<span class="hl {tone_cls}" title="{html.escape(title)}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
+                    f'<span class="hl {tone_cls}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
                 )
                 pos = sp["e"]
             if pos < len(line_text):
@@ -264,15 +279,12 @@ def _build_highlighted_resume(text: str, annotations: list[dict] | None) -> str:
         if pos < sp["s"]:
             out.append(html.escape(text[pos : sp["s"]]))
         tone_cls = {"good": "hl-good", "bad": "hl-bad", "warn": "hl-warn"}[sp["tone"]]
-        title = sp["comment"]
-        if sp["req"]:
-            title = (sp["req"] + (" — " if sp["comment"] else "")) + sp["comment"]
         content = html.escape(text[sp["s"] : sp["e"]])
         data_comment = html.escape(sp["comment"]) if sp["comment"] else ""
         data_req = html.escape(sp["req"]) if sp["req"] else ""
         data_tone = html.escape(sp["tone"]) if sp["tone"] else ""
         out.append(
-            f'<span class="hl {tone_cls}" title="{html.escape(title)}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
+            f'<span class="hl {tone_cls}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
         )
         pos = sp["e"]
     if pos < L:
@@ -312,6 +324,7 @@ async def index(request: Request, q: str | None = None, status: str | None = Non
             "STATUS_CHOICES": STATUS_CHOICES,
             "q": q or "",
             "filter_status": status or "",
+            "upload_enabled": bool(API_BASE_URL and MODEL_NAME),
         },
     )
 
@@ -411,6 +424,17 @@ async def update_status(cid: int, new_status: str = Form(...)):
         )
         await db.commit()
     return RedirectResponse(url=f"/candidates/{cid}", status_code=303)
+
+
+@app.post("/candidates/{cid}/delete")
+async def delete_candidate(cid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # delete analyses first (no ON DELETE CASCADE in schema)
+        await db.execute("DELETE FROM analyses WHERE candidate_id=?", (cid,))
+        # delete candidate
+        await db.execute("DELETE FROM candidates WHERE id=?", (cid,))
+        await db.commit()
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/stats", response_class=HTMLResponse)
@@ -533,3 +557,74 @@ async def requirements_delete(filename: str = Form(...)):
         except Exception:
             pass
     return RedirectResponse(url="/requirements", status_code=303)
+
+
+@app.post("/candidates/upload")
+async def candidates_upload(files: List[UploadFile] = File(...)):
+    job_sets = _load_all_job_sets()
+    if not job_sets:
+        return RedirectResponse(url="/requirements", status_code=303)
+
+    saved_any = False
+    for uf in files:
+        name = os.path.basename(uf.filename or "").strip()
+        if not name:
+            continue
+        # save file
+        os.makedirs(FILES_DIR, exist_ok=True)
+        dest = os.path.join(FILES_DIR, name)
+        data = await uf.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+
+        # extract text
+        resume_text = extract_text(dest)
+        if not (resume_text or "").strip():
+            continue
+
+        # analyze
+        try:
+            result = agent.analyze_and_questions(resume_text, job_sets)
+        except Exception:
+            continue
+
+        # parse avg score, summary, status
+        avg_score: int | None = None
+        summary = ""
+        try:
+            if isinstance(result, dict) and isinstance(result.get("Анализ"), dict):
+                avg_score = int(result["Анализ"].get("Средняя оценка"))
+                summary = str(result["Анализ"].get("Общий вывод", ""))
+        except Exception:
+            pass
+        status = (result.get("Статус") or {}) if isinstance(result, dict) else {}
+        is_resume = bool(status.get("Это резюме", True))
+
+        # save to DB
+        try:
+            await create_candidate_and_analysis(
+                full_name=(result.get("Кандидат", {}) or {}).get("ФИО") if isinstance(result, dict) else None,
+                age=(result.get("Кандидат", {}) or {}).get("Возраст") if isinstance(result, dict) else None,
+                gender=(result.get("Кандидат", {}) or {}).get("Пол") if isinstance(result, dict) else None,
+                phone=(result.get("Кандидат", {}) or {}).get("Телефон") if isinstance(result, dict) else None,
+                address=(result.get("Кандидат", {}) or {}).get("Адрес") if isinstance(result, dict) else None,
+                resume_path=dest,
+                raw_resume_text=resume_text,
+                avg_score=avg_score if isinstance(avg_score, int) else -1,
+                verdict=("positive" if (isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD) else "negative"),
+                summary=summary or "—",
+                raw_json=result,
+                is_resume=is_resume,
+            )
+            saved_any = True
+        except Exception:
+            continue
+
+    return RedirectResponse(url="/", status_code=303)
+def _load_all_job_sets():
+    paths = set(parse_job_paths_env(JOB_DESCRIPTION_PATHS))
+    for p in parse_job_paths_env(JOB_DESCRIPTION_PATH_LEGACY):
+        paths.add(p)
+    for p in list_requirement_files(REQ_DIR):
+        paths.add(p)
+    return load_job_requirements_many(sorted(paths))
