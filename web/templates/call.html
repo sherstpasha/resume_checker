@@ -4,7 +4,7 @@
 
 <div class="call-wrap">
   <div class="call-stage">
-    <img id="botBackdrop" src="/static/image_bot.png" alt="bot" class="call-bot-bg">
+    <div id="botIndicator" class="bot-indicator listening" title="Состояние бота"></div>
     <video id="remoteVideo" autoplay playsinline class="call-remote"></video>
     <video id="localVideo" autoplay playsinline muted class="call-local"></video>
     <img id="personPlaceholder" src="/static/image_person.png" alt="you" class="call-local placeholder" style="display:none;">
@@ -15,9 +15,6 @@
     <button class="btn" id="micToggle" disabled>Микрофон: выкл</button>
     <button class="btn" id="videoToggle" disabled>Камера: выкл</button>
     <span id="status" class="muted"></span>
-  </div>
-  <div class="vu-wrap" id="vuWrap" style="display:none">
-    <div class="vu-bar"><div class="vu-fill" id="vuFill" style="width:0%"></div></div>
   </div>
   <div id="chat" class="card" style="max-width:960px;">
     <div id="log" style="min-height:120px; max-height:220px; overflow:auto;"></div>
@@ -50,6 +47,23 @@
           log.appendChild(div);
           log.scrollTop = log.scrollHeight;
         } catch {}
+      };
+      // Intercept state messages to toggle bot indicator (circle)
+      const _origOnMsg = ws.onmessage;
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg && msg.role === 'state' && msg.state) {
+            const el = document.getElementById('botIndicator');
+            const st = String(msg.state).toLowerCase();
+            el.classList.remove('speaking','thinking','listening');
+            if (st === 'speaking') el.classList.add('speaking');
+            else if (st === 'thinking') el.classList.add('thinking');
+            else el.classList.add('listening');
+            return;
+          }
+        } catch {}
+        if (typeof _origOnMsg === 'function') { _origOnMsg(ev); }
       };
       pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
 
@@ -109,7 +123,7 @@
       updateMic();
       micBtn.classList.toggle('btn-danger', !(audioTrack && audioTrack.enabled));
 
-      // VU meter (Web Audio API)
+      // Mic-driven animation (RMS → scale for listening state)
       try {
         const audioTracks = stream.getAudioTracks();
         if (audioTracks && audioTracks.length) {
@@ -119,31 +133,37 @@
           analyser.fftSize = 2048;
           const data = new Float32Array(analyser.fftSize);
           src.connect(analyser);
-          const wrap = document.getElementById('vuWrap');
-          const fill = document.getElementById('vuFill');
-          wrap.style.display = '';
           let rafId;
+          let smooth = 1.0;
           const render = () => {
             analyser.getFloatTimeDomainData(data);
             // RMS
             let sum = 0;
             for (let i = 0; i < data.length; i++) { const v = data[i]; sum += v*v; }
             const rms = Math.sqrt(sum / data.length);
-            const pct = Math.min(100, Math.max(0, Math.round(rms * 300))); // ~0.33 -> 100%
-            fill.style.width = pct + '%';
-            if (pct > 12) { fill.classList.add('on'); } else { fill.classList.remove('on'); }
+            const el = document.getElementById('botIndicator');
+            if (el) {
+              if (el.classList.contains('listening')) {
+                // Map RMS (~0..0.3) → target scale 1.00..1.06 (clamped)
+                const amp = Math.min(0.06, rms * 0.4); // 0..~0.12 → clamp 0.06
+                const target = 1.0 + amp;
+                // Smooth step (low-pass filter)
+                smooth = smooth * 0.85 + target * 0.15;
+                el.style.setProperty('--levelScale', smooth.toFixed(3));
+              } else {
+                smooth = 1.0;
+                el.style.setProperty('--levelScale', '1.000');
+              }
+            }
             rafId = requestAnimationFrame(render);
           };
           render();
-          // stop meter on leave
+          // cleanup on leave
           document.getElementById('leaveBtn').addEventListener('click', () => {
             try { cancelAnimationFrame(rafId); ctx.close(); } catch(_) {}
-            wrap.style.display = 'none';
           }, { once: true });
         }
-      } catch(e) {
-        // ignore VU errors
-      }
+      } catch(e) { /* ignore */ }
 
       // video toggle (show placeholder when off)
       const videoBtn = document.getElementById('videoToggle');

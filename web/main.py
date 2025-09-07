@@ -223,8 +223,13 @@ async def _transcribe_and_reply(sess: _InterviewSession, audio_f32_16k: "np.ndar
         m = _np.max(_np.abs(audio_f32_16k))
         if m > 0:
             audio_f32_16k = audio_f32_16k / m
+        use_fp16 = False
+        try:
+            use_fp16 = (getattr(sess.interviewer, "device", "cpu") == "cuda")
+        except Exception:
+            use_fp16 = False
         result = sess.interviewer.stt_model.transcribe(
-            audio_f32_16k, language="ru", fp16=False
+            audio_f32_16k, language="ru", fp16=use_fp16
         )
         user_text = (result.get("text") or "").strip()
         if not user_text:
@@ -232,6 +237,11 @@ async def _transcribe_and_reply(sess: _InterviewSession, audio_f32_16k: "np.ndar
         await _ws_broadcast(sess, {"role": "user", "text": user_text})
         try:
             sess.log.append({"role": "user", "text": user_text})
+        except Exception:
+            pass
+        # thinking state while generating reply
+        try:
+            await _ws_broadcast(sess, {"role": "state", "state": "thinking"})
         except Exception:
             pass
         reply = sess.interviewer.reply(user_text)
@@ -242,9 +252,24 @@ async def _transcribe_and_reply(sess: _InterviewSession, audio_f32_16k: "np.ndar
             pass
         # optional: speak locally on server, not sent back yet
         try:
+            # small delay before 'speaking' to ensure audio device readiness
+            import asyncio as _asyncio
+            try:
+                await _asyncio.sleep(2)
+            except Exception:
+                pass
+            try:
+                await _ws_broadcast(sess, {"role": "state", "state": "speaking"})
+            except Exception:
+                pass
             sess.interviewer.tts.speak(reply)
         except Exception:
             pass
+        finally:
+            try:
+                await _ws_broadcast(sess, {"role": "state", "state": "listening"})
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1084,6 +1109,65 @@ async def webrtc_offer(cid: int, payload: dict):
     async def on_track(track):
         # Attach handlers for inbound audio/video to verify we receive media
         sess = await _get_or_create_session(cid)
+        # Auto-greet once when media starts flowing (first track)
+        try:
+            if not getattr(sess, "_greeted", False):
+                setattr(sess, "_greeted", True)
+                import asyncio as _aio
+
+                async def _greet_flow():
+                    try:
+                        if sess.ended or (sess.interviewer is None):
+                            return
+                        try:
+                            await _ws_broadcast(sess, {"role": "state", "state": "thinking"})
+                        except Exception:
+                            pass
+                        reply = None
+                        try:
+                            trigger = (
+                                "Сделай короткое дружелюбное приветствие (1–2 предложения) и задай первый конкретный вопрос по теме вакансии."
+                            )
+                            msgs = list(getattr(sess.interviewer, "dialogue_history", [])) + [
+                                {"role": "user", "content": trigger}
+                            ]
+                            reply = sess.interviewer._call_llm(msgs)
+                            try:
+                                sess.interviewer.dialogue_history.append({"role": "assistant", "content": reply})
+                            except Exception:
+                                pass
+                        except Exception:
+                            reply = "Здравствуйте! Давайте начнём. Расскажите, пожалуйста, кратко о своём текущем опыте и роли?"
+
+                        await _ws_broadcast(sess, {"role": "assistant", "text": reply})
+                        try:
+                            sess.log.append({"role": "assistant", "text": reply})
+                        except Exception:
+                            pass
+                        # small pause before switching to 'speaking'
+                        try:
+                            await _aio.sleep(2)
+                        except Exception:
+                            pass
+                        try:
+                            await _ws_broadcast(sess, {"role": "state", "state": "speaking"})
+                        except Exception:
+                            pass
+                        try:
+                            loop = _aio.get_running_loop()
+                            await loop.run_in_executor(None, lambda: sess.interviewer.tts.speak(reply))
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            await _ws_broadcast(sess, {"role": "state", "state": "listening"})
+                        except Exception:
+                            pass
+
+                task = _aio.create_task(_greet_flow())
+                sess.tasks.add(task)
+        except Exception:
+            pass
         if track.kind == "audio":
             local_audio = relay.subscribe(track)
 
