@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Собеседование с кандидатом #{{ cid }}</h2>
+
+<div class="call-wrap">
+  <div class="call-stage">
+    <img id="botBackdrop" src="/static/image_bot.png" alt="bot" class="call-bot-bg">
+    <video id="remoteVideo" autoplay playsinline class="call-remote"></video>
+    <video id="localVideo" autoplay playsinline muted class="call-local"></video>
+    <img id="personPlaceholder" src="/static/image_person.png" alt="you" class="call-local placeholder" style="display:none;">
+  </div>
+  <div class="call-controls">
+    <button class="btn" id="joinBtn">Подключиться</button>
+    <button class="btn" id="leaveBtn" disabled>Отключиться</button>
+    <button class="btn" id="micToggle" disabled>Микрофон: выкл</button>
+    <button class="btn" id="videoToggle" disabled>Камера: выкл</button>
+    <span id="status" class="muted"></span>
+  </div>
+  <div class="muted">Дайте доступ к микрофону и (по желанию) к камере.</div>
+  <input type="hidden" id="cid" value="{{ cid }}">
+</div>
+<script>
+  let pc;
+  const status = (t) => document.getElementById('status').textContent = t;
+
+  async function join() {
+    try {
+      const cid = document.getElementById('cid').value;
+      pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+      // remote
+      const remoteVideo = document.getElementById('remoteVideo');
+      pc.ontrack = (ev) => {
+        if (ev.streams && ev.streams[0]) remoteVideo.srcObject = ev.streams[0];
+        else remoteVideo.srcObject = new MediaStream([ev.track]);
+      };
+
+      // local
+      // Try to get user media; if camera is unavailable, fall back to audio only
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      } catch(e) {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      }
+      const localVideo = document.getElementById('localVideo');
+      const placeholder = document.getElementById('personPlaceholder');
+      if (stream.getVideoTracks().length) {
+        localVideo.srcObject = stream;
+        localVideo.style.display = '';
+        placeholder.style.display = 'none';
+      } else {
+        localVideo.style.display = 'none';
+        placeholder.style.display = '';
+      }
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+      // mic toggle
+      const micBtn = document.getElementById('micToggle');
+      const audioTrack = stream.getAudioTracks()[0] || null;
+      micBtn.disabled = !audioTrack;
+      function updateMic() {
+        if (!audioTrack) return;
+        micBtn.textContent = 'Микрофон: ' + (audioTrack.enabled ? 'вкл' : 'выкл');
+      }
+      micBtn.onclick = () => { if (audioTrack) { audioTrack.enabled = !audioTrack.enabled; updateMic(); } };
+      updateMic();
+
+      // video toggle (show placeholder when off)
+      const videoBtn = document.getElementById('videoToggle');
+      const videoTrack = stream.getVideoTracks()[0] || null;
+      videoBtn.disabled = !videoTrack;
+      function updateVideo() {
+        if (!videoTrack) return;
+        videoBtn.textContent = 'Камера: ' + (videoTrack.enabled ? 'вкл' : 'выкл');
+        if (videoTrack.enabled) { localVideo.style.display = ''; placeholder.style.display = 'none'; }
+        else { localVideo.style.display = 'none'; placeholder.style.display = ''; }
+      }
+      videoBtn.onclick = () => { if (videoTrack) { videoTrack.enabled = !videoTrack.enabled; updateVideo(); } };
+      updateVideo();
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const resp = await fetch(`/webrtc/offer/${cid}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+      });
+      const data = await resp.json();
+      await pc.setRemoteDescription(new RTCSessionDescription(data));
+
+      document.getElementById('joinBtn').disabled = true;
+      document.getElementById('leaveBtn').disabled = false;
+      document.getElementById('micToggle').disabled = false;
+      if (videoTrack) document.getElementById('videoToggle').disabled = false;
+      status('Подключено');
+    } catch (e) {
+      status('Ошибка: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  function leave() {
+    try {
+      if (pc) {
+        pc.getSenders().forEach(s => s.track && s.track.stop());
+        pc.close();
+        pc = null;
+      }
+    } finally {
+      document.getElementById('joinBtn').disabled = false;
+      document.getElementById('leaveBtn').disabled = true;
+      // disable toggles when not connected
+      const micBtn = document.getElementById('micToggle');
+      const videoBtn = document.getElementById('videoToggle');
+      micBtn.disabled = true; micBtn.textContent = 'Микрофон: выкл';
+      if (videoBtn) { videoBtn.disabled = true; videoBtn.textContent = 'Камера: выкл'; }
+      status('Отключено');
+    }
+  }
+
+  document.getElementById('joinBtn').onclick = join;
+  document.getElementById('leaveBtn').onclick = leave;
+</script>
+{% endblock %}

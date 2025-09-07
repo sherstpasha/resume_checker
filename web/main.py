@@ -8,6 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from typing import List
 from dotenv import load_dotenv
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc.contrib.media import MediaBlackhole, MediaRelay
 from utils import extract_text, load_job_requirements_many, parse_job_paths_env, list_requirement_files
 from agents.resume_analyzer import ResumeAnalyzerAgent
 from db import create_candidate_and_analysis
@@ -26,6 +28,7 @@ RESUME_THRASH = os.getenv("RESUME_THRASH")
 RESUME_THRESHOLD = int(RESUME_THRASH) if RESUME_THRASH is not None else int(os.getenv("RESUME_THRESHOLD", "75"))
 JOB_DESCRIPTION_PATHS = os.getenv("JOB_DESCRIPTION_PATHS", "")
 JOB_DESCRIPTION_PATH_LEGACY = os.getenv("JOB_DESCRIPTION_PATH", "")
+CALL_BASE_URL = os.getenv("CALL_BASE_URL", "http://localhost:8000")
 
 app = FastAPI(title="HR Resume Bot — Admin")
 app.mount(
@@ -41,6 +44,11 @@ agent = (
     if (API_BASE_URL and MODEL_NAME)
     else None
 )
+
+# --- WebRTC globals ---
+peers: dict[str, RTCPeerConnection] = {}
+relay = MediaRelay()
+RTC_CONF = RTCConfiguration(iceServers=[RTCIceServer("stun:stun.l.google.com:19302")])
 
 STATUS_CHOICES = [
     ("screen_pending", "Ожидает скрининг"),
@@ -410,6 +418,7 @@ async def candidate_detail(request: Request, cid: int):
             "analyses": analyses,
             "STATUS_CHOICES": STATUS_CHOICES,
             "status_label": status_label(candidate.get("candidate_status")),
+            "call_base_url": CALL_BASE_URL,
         },
     )
 
@@ -720,3 +729,62 @@ def _load_all_job_sets():
     for p in list_requirement_files(REQ_DIR):
         paths.add(p)
     return load_job_requirements_many(sorted(paths))
+
+
+# --------- WebRTC: call page + offer endpoint ---------
+@app.get("/call/{cid}", response_class=HTMLResponse)
+async def call_page(request: Request, cid: int):
+    return templates.TemplateResponse("call.html", {"request": request, "cid": cid})
+
+
+@app.post("/webrtc/offer/{cid}")
+async def webrtc_offer(cid: int, payload: dict):
+    import uuid, asyncio
+    offer = RTCSessionDescription(sdp=payload.get("sdp"), type=payload.get("type"))
+    pc = RTCPeerConnection(RTC_CONF)
+    pid = f"{cid}-{uuid.uuid4()}"
+    peers[pid] = pc
+    recorder = MediaBlackhole()
+
+    @pc.on("track")
+    async def on_track(track):
+        # Attach handlers for inbound audio/video to verify we receive media
+        if track.kind == "audio":
+            local_audio = relay.subscribe(track)
+            async def read_audio():
+                while True:
+                    try:
+                        frame = await local_audio.recv()
+                        # TODO: plug ASR here later
+                    except Exception:
+                        # MediaStreamError is raised when stream ends; exit loop quietly
+                        break
+            audio_task = asyncio.create_task(read_audio())
+        elif track.kind == "video":
+            local_video = relay.subscribe(track)
+            async def read_video():
+                while True:
+                    try:
+                        frame = await local_video.recv()
+                        # TODO: plug video processing here later
+                    except Exception:
+                        break
+            video_task = asyncio.create_task(read_video())
+        await recorder.start()
+
+        @track.on("ended")
+        async def on_ended():
+            await recorder.stop()
+            # cancel reader tasks if any
+            try:
+                if track.kind == "audio" and 'audio_task' in locals():
+                    audio_task.cancel()
+                if track.kind == "video" and 'video_task' in locals():
+                    video_task.cancel()
+            except Exception:
+                pass
+
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}

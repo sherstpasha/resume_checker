@@ -2,34 +2,70 @@
 {% block content %}
 <h1>Кандидат #{{ c.id }}</h1>
 
-<section>
+<section class="card">
   <h3>Паспорт</h3>
-  <ul class="kv">
-    <li><b>ФИО:</b> {{ c.full_name or "—" }}</li>
-    <li><b>Возраст:</b> {{ c.age or "—" }}</li>
-    <li><b>Пол:</b> {{ c.gender or "—" }}</li>
-    <li><b>Телефон:</b> {{ c.phone or "—" }}</li>
-    <li><b>Адрес:</b> {{ c.address or "—" }}</li>
-    <li><b>Статус:</b> <span class="badge">{{ status_label }}</span></li>
-    <li><b>Файл:</b> {{ c.resume_path }}</li>
-    <li><b>Создан:</b> {{ c.created_at }}</li>
-  </ul>
+    <ul class="kv">
+      <li><b>ФИО:</b> {{ c.full_name or "—" }}</li>
+      <li><b>Возраст:</b> {{ c.age or "—" }}</li>
+      <li><b>Пол:</b> {{ c.gender or "—" }}</li>
+      <li><b>Телефон:</b> {{ c.phone or "—" }}</li>
+      <li><b>Адрес:</b> {{ c.address or "—" }}</li>
+      <li><b>Статус:</b> <span class="badge status-{{ c.candidate_status }}">{{ status_label }}</span></li>
+      <li><b>Файл:</b> {{ c.resume_path }}</li>
+      <li><b>Создан:</b> {{ c.created_at }}</li>
+    </ul>
 
-  <form method="post" action="/candidates/{{ c.id }}/status" class="inline">
-    <select name="new_status">
-      {% for code,label in STATUS_CHOICES %}
-        <option value="{{ code }}" {% if code==c.candidate_status %}selected{% endif %}>{{ label }}</option>
-      {% endfor %}
-    </select>
-    <button>Обновить статус</button>
-  </form>
+  <div class="actions-row">
+    <form method="post" action="/candidates/{{ c.id }}/status" class="inline">
+      <select name="new_status">
+        {% for code,label in STATUS_CHOICES %}
+          <option value="{{ code }}" {% if code==c.candidate_status %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <button class="btn">Обновить статус</button>
+    </form>
 
-  <form method="post" action="/candidates/{{ c.id }}/delete" class="inline" onsubmit="return confirm('Удалить кандидата #{{ c.id }} и все связанные анализы? Операция необратима.');">
-    <button class="btn-danger">Удалить кандидата</button>
-  </form>
+    <form method="post" action="/candidates/{{ c.id }}/delete" class="inline" onsubmit="return confirm('Удалить кандидата #{{ c.id }} и все связанные анализы? Операция необратима.');">
+      <button class="btn-danger" id="deleteBtn">Удалить кандидата</button>
+    </form>
+  </div>
+  {% if c.candidate_status == 'screen_passed' %}
+    <div class="actions-row-secondary">
+      <button class="btn-outline" id="copyCallBtn">Скопировать ссылку на собеседование</button>
+    </div>
+  {% endif %}
 </section>
 
-<section>
+<script>
+  (function(){
+    const btn = document.getElementById('copyCallBtn');
+    const delBtn = document.getElementById('deleteBtn');
+    if (btn) {
+      btn.addEventListener('click', async () => {
+        const url = '{{ call_base_url }}/call/{{ c.id }}';
+        try {
+          await navigator.clipboard.writeText(url);
+          btn.textContent = 'Скопировано';
+          setTimeout(() => btn.textContent = 'Скопировать ссылку на собеседование', 1200);
+        } catch (e) {
+          // fallback
+          const ta = document.createElement('textarea');
+          ta.value = url; document.body.appendChild(ta); ta.select();
+          document.execCommand('copy'); document.body.removeChild(ta);
+        }
+      });
+    }
+    if (delBtn) {
+      delBtn.addEventListener('click', () => {
+        delBtn.textContent = 'Удаление…';
+        delBtn.classList.add('disabled');
+        setTimeout(() => { /* visual feedback only */ }, 50);
+      });
+    }
+  })();
+  </script>
+
+<section class="card">
   <h3>Отчет скрининга</h3>
   {% if analyses %}
     <ul>

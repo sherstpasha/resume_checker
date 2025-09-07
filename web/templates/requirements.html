@@ -2,14 +2,14 @@
 {% block content %}
 <div class="container mt-4">
   <h2>Файлы требований</h2>
+  <div class="card">
   <p>Папка: <code>{{ req_dir }}</code></p>
 
   <form class="mb-3" action="/requirements/upload" method="post" enctype="multipart/form-data">
-    <div class="mb-2">
-      <input class="form-control" type="file" name="files" multiple>
+    <div class="file-row">
+      <input id="reqFiles" class="file-input" type="file" name="files" multiple onchange="this.form.submit()">
+      <label for="reqFiles" class="file-label">Выбрать файлы</label>
     </div>
-    <div class="form-text">Поддерживаемые расширения: {{ exts }}</div>
-    <button class="btn btn-primary mt-2" type="submit">Загрузить</button>
   </form>
 
   <table class="table table-striped">
@@ -37,6 +37,6 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
 </div>
 {% endblock %}
-
