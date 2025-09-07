@@ -48,7 +48,7 @@ JOB_DESCRIPTION_PATH_LEGACY = os.getenv("JOB_DESCRIPTION_PATH", "")
 CALL_BASE_URL = os.getenv("CALL_BASE_URL", "http://localhost:8000")
 STT_DEVICE_PREF = (os.getenv("STT_DEVICE", "auto") or "auto").lower()  # auto|cuda|cpu
 DEBUG_VAD = (os.getenv("DEBUG_VAD", "0") or "0").lower() in ("1", "true", "yes", "on")
-RMS_GATE = float(os.getenv("RMS_GATE", "0.01"))  # fallback голосовой порог по RMS
+RMS_GATE = float(os.getenv("RMS_GATE", "0.03"))  # fallback голосовой порог по RMS
 
 app = FastAPI(title="HR Resume Bot — Admin")
 app.mount(
@@ -1152,6 +1152,9 @@ async def webrtc_offer(cid: int, payload: dict):
                             chunk = _np.concatenate(sess.audio_buffer)
                             sess.audio_buffer.clear()
                             sess.silent_chunks = 0
+                            # skip too-short chunks (<1s) to improve ASR quality
+                            if chunk.size < SAMPLERATE:
+                                continue
                             if DEBUG_VAD:
                                 try:
                                     rms_chunk = float(_np.sqrt(_np.mean(chunk * chunk)))
@@ -1199,3 +1202,4 @@ async def webrtc_offer(cid: int, payload: dict):
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+

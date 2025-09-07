@@ -101,3 +101,5 @@ select { padding:8px 10px; border:1px solid #cbd5e0; border-radius:6px; backgrou
 .card h3 { margin-top:0; }
 .card .table { margin-top:8px; }
 .row-status-screen_pending { background:#fffaf0; }
+/* Hide permission hint on call page */
+.call-wrap > .muted { display:none !important; }

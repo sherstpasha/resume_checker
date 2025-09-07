@@ -27,13 +27,19 @@
 </div>
 <script>
   let pc;
+  let ws;
+  let joining = false;
   const status = (t) => document.getElementById('status').textContent = t;
 
   async function join() {
     try {
+      if (pc || joining) { return; }
+      joining = true;
+      document.getElementById('joinBtn').disabled = true;
       const cid = document.getElementById('cid').value;
-      // websocket for transcripts/replies
-      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + `/call/ws/${cid}`);
+      // websocket for transcripts/replies (ensure single instance)
+      if (ws) { try { ws.close(); } catch(_) {} ws = null; }
+      ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + `/call/ws/${cid}`);
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
@@ -58,20 +64,37 @@
       // Try to get user media; if camera is unavailable, fall back to audio only
       let stream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        // Prefer raw mic without browser DSP for better ASR
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1,
+            sampleRate: 48000
+          },
+          video: true
+        });
       } catch(e) {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1,
+            sampleRate: 48000
+          },
+          video: false
+        });
       }
       const localVideo = document.getElementById('localVideo');
       const placeholder = document.getElementById('personPlaceholder');
-      if (stream.getVideoTracks().length) {
-        localVideo.srcObject = stream;
-        localVideo.style.display = '';
-        placeholder.style.display = 'none';
-      } else {
-        localVideo.style.display = 'none';
-        placeholder.style.display = '';
-      }
+      // ensure camera starts disabled if present
+      try { const vt0 = stream.getVideoTracks()[0]; if (vt0) vt0.enabled = false; } catch(_) {}
+      localVideo.srcObject = stream;
+      const _vt = stream.getVideoTracks()[0] || null;
+      if (_vt && _vt.enabled) { localVideo.style.display = ''; placeholder.style.display = 'none'; }
+      else { localVideo.style.display = 'none'; placeholder.style.display = ''; }
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
       // mic toggle
@@ -82,8 +105,9 @@
         if (!audioTrack) return;
         micBtn.textContent = 'Микрофон: ' + (audioTrack.enabled ? 'вкл' : 'выкл');
       }
-      micBtn.onclick = () => { if (audioTrack) { audioTrack.enabled = !audioTrack.enabled; updateMic(); } };
+      micBtn.onclick = () => { if (audioTrack) { audioTrack.enabled = !audioTrack.enabled; updateMic(); micBtn.classList.toggle('btn-danger', !audioTrack.enabled); } };
       updateMic();
+      micBtn.classList.toggle('btn-danger', !(audioTrack && audioTrack.enabled));
 
       // VU meter (Web Audio API)
       try {
@@ -131,8 +155,9 @@
         if (videoTrack.enabled) { localVideo.style.display = ''; placeholder.style.display = 'none'; }
         else { localVideo.style.display = 'none'; placeholder.style.display = ''; }
       }
-      videoBtn.onclick = () => { if (videoTrack) { videoTrack.enabled = !videoTrack.enabled; updateVideo(); } };
+      videoBtn.onclick = () => { if (videoTrack) { videoTrack.enabled = !videoTrack.enabled; updateVideo(); videoBtn.classList.toggle('btn-danger', !videoTrack.enabled); } };
       updateVideo();
+      videoBtn.classList.toggle('btn-danger', !(videoTrack && videoTrack.enabled));
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -142,7 +167,10 @@
         body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
       });
       const data = await resp.json();
-      await pc.setRemoteDescription(new RTCSessionDescription(data));
+      if (!pc.currentRemoteDescription) {
+        await pc.setRemoteDescription(new RTCSessionDescription(data));
+      }
+      joining = false;
 
       document.getElementById('joinBtn').disabled = true;
       document.getElementById('leaveBtn').disabled = false;
@@ -150,6 +178,12 @@
       if (videoTrack) document.getElementById('videoToggle').disabled = false;
       status('Подключено');
     } catch (e) {
+      try { if (pc) { pc.getSenders().forEach(s => s.track && s.track.stop()); pc.close(); } } catch(_) {}
+      pc = null;
+      try { if (ws) { ws.close(); } } catch(_) {}
+      ws = null;
+      joining = false;
+      document.getElementById('joinBtn').disabled = false;
       status('Ошибка: ' + (e && e.message ? e.message : e));
     }
   }
@@ -164,6 +198,8 @@
         pc.close();
         pc = null;
       }
+      try { if (ws) { ws.close(); } } catch(_) {}
+      ws = null;
     } finally {
       document.getElementById('joinBtn').disabled = false;
       document.getElementById('leaveBtn').disabled = true;
