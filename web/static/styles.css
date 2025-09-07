@@ -12,3 +12,33 @@ body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-seri
 .inline { margin-top:10px; }
 .filters { display:flex; gap:8px; margin:12px 0; }
 @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+
+/* Report styles */
+.report { margin-top: 10px; }
+.report > summary { cursor:pointer; margin-bottom:8px; }
+.req-grid { display:grid; grid-template-columns: 1fr auto; gap:8px 16px; align-items:center; }
+.req-item { border-bottom:1px dashed #eee; padding:8px 0; grid-column: 1 / -1; display:grid; grid-template-columns: 1fr auto; gap:8px 16px; }
+.req-text { font-weight: 500; }
+.req-visual { text-align:right; }
+.req-comment { grid-column: 1 / -1; color:#555; font-size: 13px; margin-top:4px; }
+
+/* Circular progress using conic-gradient */
+/* removed circular visuals per request */
+
+/* Resume annotations */
+.resume-box { margin: 10px 0; border:1px solid #eee; border-radius:6px; background:#fafafa; padding:10px; max-height: 420px; overflow:auto; }
+.resume-annotated pre, .resume-annotated .line, .resume-raw { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.5; }
+.resume-annotated .line { padding: 1px 0 1px 48px; position: relative; }
+.resume-annotated .line::before { content: attr(data-line); position:absolute; left:0; width:40px; color:#999; text-align:right; padding-right:8px; }
+.hl { padding: 1px 2px; border-radius: 3px; border-left: 3px solid transparent; }
+.hl-good { background: #e6f4ea; border-left-color: #34a853; }
+.hl-warn { background: #fff8e1; border-left-color: #fbbc05; }
+.hl-bad  { background: #fde7e9; border-left-color: #ea4335; }
+
+/* Tooltip */
+.tooltip-floating { z-index: 1000; background: #111; color: #fff; padding:8px 10px; border-radius:6px; font-size: 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,0.25); }
+.tooltip-floating .tip-req { font-weight: 600; margin-bottom: 4px; }
+.tooltip-floating .tip-comment { opacity: 0.95; }
+.tooltip-floating[data-tone="good"] { background:#1b5e20; }
+.tooltip-floating[data-tone="warn"] { background:#7f6000; }
+.tooltip-floating[data-tone="bad"]  { background:#6a1b1a; }
