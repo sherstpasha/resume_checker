@@ -35,7 +35,6 @@
   let sttInterval = null; // periodic sender // fallback timer if no greeting arrives
   let joining = false;
   const status = (t) => document.getElementById('status').textContent = t;
-  const USE_BROWSER_STT = {{ 'true' if use_browser_stt else 'false' }};
   const botEl = () => document.getElementById('botIndicator');
   function setBotState(state) {
     const el = botEl();
@@ -72,6 +71,22 @@
           div.textContent = (msg.role === 'assistant' ? '🤖 ' : (msg.role === 'user' ? '👤 ' : 'ℹ️ ')) + (msg.text || '');
           log.appendChild(div);
           log.scrollTop = log.scrollHeight;
+          // Play server-side TTS audio if provided
+          if (msg.role === 'assistant' && msg.audio_url) {
+            try {
+              const aSender = pc && pc.getSenders().find(s=>s.track && s.track.kind==='audio');
+              isSpeaking = true; setBotState('speaking');
+              if (aSender && aSender.track) aSender.track.enabled = false;
+              try { if (recog) recog.stop(); } catch(_) {}
+              const au = new Audio(msg.audio_url);
+              au.onended = () => {
+                isSpeaking = false; setBotState('listening');
+                if (aSender && aSender.track) aSender.track.enabled = !!userMicEnabled;
+                try { if (recog && userMicEnabled) recog.start(); } catch(_) {}
+              };
+              au.play().catch(()=>{});
+            } catch(_) {}
+          }
         } catch {}
       };
       // Intercept state/assistant messages to enforce half‑duplex
@@ -79,7 +94,7 @@
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
-          // Client-side TTS disabled; rely on server states
+          // Client-side TTS: speak assistant reply and enforce half‑duplex
           if (false && msg && msg.role === 'assistant' && msg.text) {
             try {
               const aSender = pc && pc.getSenders().find(s=>s.track && s.track.kind==='audio');

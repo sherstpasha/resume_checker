@@ -343,6 +343,23 @@ class FallbackTTS:
     def speak(self, text: str):
         self.silero.speak(text)
 
+    def synthesize_to_file(self, text: str) -> str:
+        """
+        Produce audio file on disk and return its path (blocking).
+        Prefer EdgeTTS; if it fails, fall back to Silero.
+        """
+        try:
+            import asyncio as _aio
+            return _aio.run(self.edge.synthesize(text))
+        except Exception:
+            try:
+                return self.silero.synthesize(text)
+            except Exception:
+                import tempfile, os as _os
+                fd, p = tempfile.mkstemp(suffix=".wav")
+                _os.close(fd)
+                return p
+
 
 #        try:
 #            print("🎤 [TTS] EdgeTTS…")

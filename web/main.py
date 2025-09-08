@@ -29,6 +29,7 @@ from agents.resume_analyzer import ResumeAnalyzerAgent
 import torch
 from db import create_candidate_and_analysis, save_interview, init_db
 from bot import main as start_bot_polling
+from fastapi.responses import FileResponse
 
 # Load .env so env vars are available when running via uvicorn
 load_dotenv()
@@ -40,6 +41,8 @@ API_BASE_URL = os.getenv("API_BASE_URL")
 MODEL_NAME = os.getenv("MODEL_NAME")
 FILES_DIR = os.getenv("FILES_DIR", "./storage")
 os.makedirs(FILES_DIR, exist_ok=True)
+TTS_DIR = os.path.join(FILES_DIR, "tts")
+os.makedirs(TTS_DIR, exist_ok=True)
 RESUME_THRASH = os.getenv("RESUME_THRASH")
 RESUME_THRESHOLD = (
     int(RESUME_THRASH)
@@ -1173,34 +1176,32 @@ async def webrtc_offer(cid: int, payload: dict):
                         except Exception:
                             reply = "Здравствуйте! Давайте начнём. Расскажите, пожалуйста, кратко о своём текущем опыте и роли?"
 
-                        await _ws_broadcast(sess, {"role": "assistant", "text": reply})
+                        # Synthesize assistant audio via FallbackTTS and send with audio_url
+                        audio_url = None
+                        try:
+                            import uuid as _uuid
+                            name = f"{cid}-{_uuid.uuid4()}.mp3"
+                            path = os.path.join(TTS_DIR, name)
+                            out_path = sess.interviewer.tts.synthesize_to_file(reply)
+                            try:
+                                os.replace(out_path, path)
+                            except Exception:
+                                try:
+                                    import shutil as _shutil
+                                    _shutil.copyfile(out_path, path)
+                                except Exception:
+                                    path = out_path
+                            audio_url = f"/call/audio/{os.path.basename(path)}"
+                        except Exception:
+                            audio_url = None
+
+                        await _ws_broadcast(sess, {"role": "assistant", "text": reply, "audio_url": audio_url})
                         try:
                             sess.log.append({"role": "assistant", "text": reply})
                         except Exception:
                             pass
-                        # speak with server TTS; enforce speaking state
-                        try:
-                            await _ws_broadcast(sess, {"role": "state", "state": "speaking"})
-                            sess.is_speaking = True
-                            # clear pending buffers to avoid echo-triggering
-                            try:
-                                sess.audio_buffer.clear()
-                                sess.silent_chunks = 0
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                        try:
-                            loop = _aio.get_running_loop()
-                            await loop.run_in_executor(None, lambda: sess.interviewer.tts.speak(reply))
-                        except Exception:
-                            pass
                     finally:
-                        try:
-                            await _ws_broadcast(sess, {"role": "state", "state": "listening"})
-                            sess.is_speaking = False
-                        except Exception:
-                            pass
+                        pass
 
                 task = _aio.create_task(_greet_flow())
                 sess.tasks.add(task)
@@ -1382,36 +1383,49 @@ async def call_stt_ws(ws: WebSocket, cid: int):
                     reply = sess.interviewer.reply(text)
             except Exception:
                 reply = ""
-            await _ws_broadcast(sess, {"role": "assistant", "text": reply})
+            # Synthesize TTS with FallbackTTS and share URL
+            audio_url = None
+            try:
+                import uuid
+                name = f"{cid}-{uuid.uuid4()}.mp3"
+                path = os.path.join(TTS_DIR, name)
+                # use synthesize_to_file (may produce mp3 or wav)
+                out_path = sess.interviewer.tts.synthesize_to_file(reply)
+                # move to TTS_DIR with our name
+                try:
+                    os.replace(out_path, path)
+                except Exception:
+                    # fallback: copy
+                    try:
+                        import shutil
+                        shutil.copyfile(out_path, path)
+                    except Exception:
+                        path = out_path
+                audio_url = f"/call/audio/{os.path.basename(path)}"
+            except Exception:
+                audio_url = None
+
+            await _ws_broadcast(sess, {"role": "assistant", "text": reply, "audio_url": audio_url})
             try:
                 sess.log.append({"role": "assistant", "text": reply})
             except Exception:
                 pass
-            # speak server-side; gate listening
-            try:
-                await _ws_broadcast(sess, {"role": "state", "state": "speaking"})
-                sess.is_speaking = True
-                try:
-                    sess.audio_buffer.clear()
-                    sess.silent_chunks = 0
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            try:
-                import asyncio as _aio
-                loop = _aio.get_running_loop()
-                await loop.run_in_executor(None, lambda: sess.interviewer.tts.speak(reply))
-            except Exception:
-                pass
-            finally:
-                try:
-                    await _ws_broadcast(sess, {"role": "state", "state": "listening"})
-                    sess.is_speaking = False
-                except Exception:
-                    pass
     except WebSocketDisconnect:
         pass
+
+
+@app.get("/call/audio/{name}")
+async def call_audio(name: str):
+    # basic path sanitization
+    safe = os.path.basename(name)
+    path = os.path.join(TTS_DIR, safe)
+    if not os.path.isfile(path):
+        # allow direct path from synthesize if move failed
+        if os.path.isfile(safe):
+            path = safe
+        else:
+            return HTMLResponse(status_code=404, content="Not found")
+    return FileResponse(path)
 
 
 # (Browser STT removed; server-side ASR only)
