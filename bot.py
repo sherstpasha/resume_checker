@@ -1,5 +1,6 @@
 import asyncio
 import os
+import logging
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher
@@ -15,6 +16,8 @@ def require_env(name: str) -> str:
     return val
 
 async def main():
+    # Basic logging to see polling and errors in console
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
     load_dotenv()
 
     bot_token = require_env("BOT_TOKEN")
@@ -31,6 +34,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(root_router)
 
+    logging.getLogger(__name__).info("Starting bot polling...")
     await dp.start_polling(bot, allowed_updates=["message", "edited_message"])
 
 if __name__ == "__main__":

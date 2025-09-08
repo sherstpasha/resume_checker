@@ -1,4 +1,6 @@
 import os
+import asyncio
+import contextlib
 import json
 import html
 import aiosqlite
@@ -26,6 +28,7 @@ from utils import (
 from agents.resume_analyzer import ResumeAnalyzerAgent
 import torch
 from db import create_candidate_and_analysis, save_interview, init_db
+from bot import main as start_bot_polling
 
 # Load .env so env vars are available when running via uvicorn
 load_dotenv()
@@ -47,6 +50,7 @@ JOB_DESCRIPTION_PATHS = os.getenv("JOB_DESCRIPTION_PATHS", "")
 JOB_DESCRIPTION_PATH_LEGACY = os.getenv("JOB_DESCRIPTION_PATH", "")
 CALL_BASE_URL = os.getenv("CALL_BASE_URL", "http://localhost:8000")
 STT_DEVICE_PREF = (os.getenv("STT_DEVICE", "auto") or "auto").lower()  # auto|cuda|cpu
+USE_BROWSER_STT = (os.getenv("USE_BROWSER_STT", "1") or "1").lower() in ("1", "true", "yes", "on")
 DEBUG_VAD = (os.getenv("DEBUG_VAD", "0") or "0").lower() in ("1", "true", "yes", "on")
 RMS_GATE = float(os.getenv("RMS_GATE", "0.03"))  # fallback голосовой порог по RMS
 
@@ -104,6 +108,7 @@ class _InterviewSession:
         self.log: list[dict] = []
         self.tasks: set = set()
         self.ended: bool = False
+        self.is_speaking: bool = False
 
 
 sessions: dict[int, _InterviewSession] = {}
@@ -244,8 +249,37 @@ async def _transcribe_and_reply(sess: _InterviewSession, audio_f32_16k: "np.ndar
             await _ws_broadcast(sess, {"role": "state", "state": "thinking"})
         except Exception:
             pass
+        # Generate reply text
         reply = sess.interviewer.reply(user_text)
+        # Show assistant text first
         await _ws_broadcast(sess, {"role": "assistant", "text": reply})
+        try:
+            sess.log.append({"role": "assistant", "text": reply})
+        except Exception:
+            pass
+        # Speak with TTS and gate listening
+        try:
+            await _ws_broadcast(sess, {"role": "state", "state": "speaking"})
+            sess.is_speaking = True
+            try:
+                sess.audio_buffer.clear()
+                sess.silent_chunks = 0
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            import asyncio as _aio
+            loop = _aio.get_running_loop()
+            await loop.run_in_executor(None, lambda: sess.interviewer.tts.speak(reply))
+        except Exception:
+            pass
+        finally:
+            try:
+                await _ws_broadcast(sess, {"role": "state", "state": "listening"})
+                sess.is_speaking = False
+            except Exception:
+                pass
         try:
             sess.log.append({"role": "assistant", "text": reply})
         except Exception:
@@ -1144,13 +1178,16 @@ async def webrtc_offer(cid: int, payload: dict):
                             sess.log.append({"role": "assistant", "text": reply})
                         except Exception:
                             pass
-                        # small pause before switching to 'speaking'
-                        try:
-                            await _aio.sleep(2)
-                        except Exception:
-                            pass
+                        # speak with server TTS; enforce speaking state
                         try:
                             await _ws_broadcast(sess, {"role": "state", "state": "speaking"})
+                            sess.is_speaking = True
+                            # clear pending buffers to avoid echo-triggering
+                            try:
+                                sess.audio_buffer.clear()
+                                sess.silent_chunks = 0
+                            except Exception:
+                                pass
                         except Exception:
                             pass
                         try:
@@ -1161,6 +1198,7 @@ async def webrtc_offer(cid: int, payload: dict):
                     finally:
                         try:
                             await _ws_broadcast(sess, {"role": "state", "state": "listening"})
+                            sess.is_speaking = False
                         except Exception:
                             pass
 
@@ -1169,6 +1207,10 @@ async def webrtc_offer(cid: int, payload: dict):
         except Exception:
             pass
         if track.kind == "audio":
+            # If browser STT is enabled, do not run server-side ASR
+            if USE_BROWSER_STT:
+                await recorder.start()
+                return
             local_audio = relay.subscribe(track)
 
             async def read_audio():
@@ -1204,6 +1246,16 @@ async def webrtc_offer(cid: int, payload: dict):
                         sec_chunk = _np.concatenate(read_audio.sec_buf)
                         read_audio.sec_buf = []
                         read_audio.sec_len = 0
+
+                        # If TTS is speaking, do not listen/process
+                        if getattr(sess, "is_speaking", False):
+                            try:
+                                sess.audio_buffer.clear()
+                                sess.silent_chunks = 0
+                            except Exception:
+                                pass
+                            # skip processing while speaking
+                            continue
 
                         use_silero = (vad_model is not None)
                         # базовый RMS как резерв — более строгий, чем раньше (по умолчанию 0.01)
@@ -1286,4 +1338,132 @@ async def webrtc_offer(cid: int, payload: dict):
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+
+
+# --------- Browser STT WebSocket: receives recognized text ---------
+@app.websocket("/call/stt/{cid}")
+async def call_stt_ws(ws: WebSocket, cid: int):
+    await ws.accept()
+    sess = await _get_or_create_session(cid)
+    try:
+        while True:
+            msg_text = await ws.receive_text()
+            # parse plain or json {text, interim}
+            try:
+                data = json.loads(msg_text)
+                if isinstance(data, dict):
+                    text = (data.get("text") or "").strip()
+                    interim = bool(data.get("interim") or False)
+                else:
+                    text = str(data).strip()
+                    interim = False
+            except Exception:
+                text = (msg_text or "").strip()
+                interim = False
+            if not text:
+                continue
+            # push user message
+            try:
+                await _ws_broadcast(sess, {"role": "user", "text": text})
+                sess.log.append({"role": "user", "text": text})
+            except Exception:
+                pass
+            # Do not generate reply for interim chunks
+            if interim:
+                continue
+            # thinking -> reply
+            try:
+                await _ws_broadcast(sess, {"role": "state", "state": "thinking"})
+            except Exception:
+                pass
+            reply = None
+            try:
+                if sess.interviewer is not None:
+                    reply = sess.interviewer.reply(text)
+            except Exception:
+                reply = ""
+            await _ws_broadcast(sess, {"role": "assistant", "text": reply})
+            try:
+                sess.log.append({"role": "assistant", "text": reply})
+            except Exception:
+                pass
+            # speak server-side; gate listening
+            try:
+                await _ws_broadcast(sess, {"role": "state", "state": "speaking"})
+                sess.is_speaking = True
+                try:
+                    sess.audio_buffer.clear()
+                    sess.silent_chunks = 0
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                import asyncio as _aio
+                loop = _aio.get_running_loop()
+                await loop.run_in_executor(None, lambda: sess.interviewer.tts.speak(reply))
+            except Exception:
+                pass
+            finally:
+                try:
+                    await _ws_broadcast(sess, {"role": "state", "state": "listening"})
+                    sess.is_speaking = False
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+
+
+# (Browser STT removed; server-side ASR only)
+
+
+# ---- Telegram bot lifecycle (runs with the web app) ----
+bot_task: asyncio.Task | None = None
+
+
+async def _bot_runner():
+    # Separate wrapper to surface exceptions to server logs
+    try:
+        print("[Bot] Entering polling loop...")
+        await start_bot_polling()
+    except asyncio.CancelledError:
+        # normal shutdown
+        print("[Bot] Polling task cancelled")
+        raise
+    except Exception as e:
+        import traceback
+
+        print(f"[Bot] Polling crashed: {e}")
+        traceback.print_exc()
+
+
+@app.on_event("startup")
+async def _startup_bot():
+    global bot_task
+    if bot_task is None:
+        try:
+            bot_task = asyncio.create_task(_bot_runner())
+            print("[Startup] Telegram bot task scheduled")
+        except Exception as e:
+            # If BOT_TOKEN or other envs missing, skip starting bot
+            print(f"[Startup] Failed to start bot: {e}")
+
+
+@app.on_event("shutdown")
+async def _shutdown_bot():
+    global bot_task
+    if bot_task is not None:
+        bot_task.cancel()
+        with contextlib.suppress(Exception):
+            await bot_task
+        bot_task = None
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    # Running directly will also trigger startup events (bot starts there)
+    uvicorn.run(app, host=host, port=port)
 

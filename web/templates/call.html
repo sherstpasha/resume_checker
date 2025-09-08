@@ -25,8 +25,34 @@
 <script>
   let pc;
   let ws;
+  let sttWS;
+  let recog;
+  let isSpeaking = false;      // half-duplex: true while bot TTS plays
+  let userMicEnabled = true;   // user preference for mic
+  let readyToListen = false;   // start listening only after first bot reply
+  let firstAssistTimer = null; // fallback timer
+  let sttHypo = ""; // current interim hypothesis
+  let sttInterval = null; // periodic sender // fallback timer if no greeting arrives
   let joining = false;
   const status = (t) => document.getElementById('status').textContent = t;
+  const USE_BROWSER_STT = {{ 'true' if use_browser_stt else 'false' }};
+  const botEl = () => document.getElementById('botIndicator');
+  function setBotState(state) {
+    const el = botEl();
+    if (!el) return;
+    el.classList.remove('speaking','thinking','listening');
+    if (state === 'speaking') el.classList.add('speaking');
+    else if (state === 'thinking') el.classList.add('thinking');
+    else el.classList.add('listening');
+  }
+  function speakText(text, onStart, onEnd) {
+    try { window.speechSynthesis.cancel(); } catch(_) {}
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ru-RU'; u.rate = 1.0; u.pitch = 1.0; u.volume = 1.0;
+    u.onstart = () => { try { onStart && onStart(); } catch(_) {} };
+    u.onend = () => { try { onEnd && onEnd(); } catch(_) {} };
+    try { window.speechSynthesis.speak(u); } catch(_) {}
+  }
 
   async function join() {
     try {
@@ -48,21 +74,51 @@
           log.scrollTop = log.scrollHeight;
         } catch {}
       };
-      // Intercept state messages to toggle bot indicator (circle)
+      // Intercept state/assistant messages to enforce half‑duplex
       const _origOnMsg = ws.onmessage;
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
-          if (msg && msg.role === 'state' && msg.state) {
-            const el = document.getElementById('botIndicator');
-            const st = String(msg.state).toLowerCase();
-            el.classList.remove('speaking','thinking','listening');
-            if (st === 'speaking') el.classList.add('speaking');
-            else if (st === 'thinking') el.classList.add('thinking');
-            else el.classList.add('listening');
-            return;
+          // Client-side TTS disabled; rely on server states
+          if (false && msg && msg.role === 'assistant' && msg.text) {
+            try {
+              const aSender = pc && pc.getSenders().find(s=>s.track && s.track.kind==='audio');
+              setBotState('thinking'); // yellow pause until TTS actually starts
+              isSpeaking = true;
+              // stop recognition during speaking
+              try { if (recog) recog.stop(); } catch(_) {}
+              // mute upstream mic to avoid feedback
+              if (aSender && aSender.track) aSender.track.enabled = false;
+              speakText(msg.text,
+                () => { setBotState('speaking'); },
+                () => {
+                  isSpeaking = false;
+                  readyToListen = true; // now allow recognition flow
+                  setBotState('listening');
+                  if (firstAssistTimer) { try { clearTimeout(firstAssistTimer); } catch(_) {} firstAssistTimer = null; }
+                  // restore mic to user's preference
+                  if (aSender && aSender.track) aSender.track.enabled = !!userMicEnabled;
+                  try { if (recog && userMicEnabled) recog.start(); } catch(_) {}
+                }
+              );
+            } catch(_) {}
           }
-        } catch {}
+                    if (msg && msg.role === 'state' && msg.state) {
+            const st = String(msg.state).toLowerCase();
+            setBotState(st);
+            const aSender = pc && pc.getSenders().find(s=>s.track && s.track.kind==='audio');
+            if (st === 'speaking' || st === 'thinking') {
+              isSpeaking = true;
+              try { if (recog) recog.stop(); } catch(_) {}
+              if (aSender && aSender.track) aSender.track.enabled = false;
+            } else {
+              isSpeaking = false;
+              readyToListen = true;
+              if (aSender && aSender.track) aSender.track.enabled = !!userMicEnabled;
+              try { if (recog && userMicEnabled) recog.start(); } catch(_) {}
+            }
+            return;
+          }        } catch {}
         if (typeof _origOnMsg === 'function') { _origOnMsg(ev); }
       };
       pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
@@ -75,6 +131,10 @@
       };
 
       // local
+      // Before media: prepare speak-first mode (yellow pause)
+      isSpeaking = true; // block listening until first assistant response is spoken
+      setBotState('thinking');
+
       // Try to get user media; if camera is unavailable, fall back to audio only
       let stream;
       try {
@@ -101,6 +161,23 @@
           video: false
         });
       }
+      // ensure mic is muted while waiting for first assistant speech
+      try { const at0 = stream.getAudioTracks()[0]; if (at0) at0.enabled = false; } catch(_) {}
+      // fallback: if greeting doesn't arrive, start listening after 5s
+      try {
+        if (firstAssistTimer) { clearTimeout(firstAssistTimer); firstAssistTimer = null; }
+        firstAssistTimer = setTimeout(() => {
+          try {
+            if (isSpeaking) {
+              isSpeaking = false;
+              readyToListen = true;
+              setBotState('listening');
+              try { const a0 = stream.getAudioTracks()[0]; if (a0) a0.enabled = !!userMicEnabled; } catch(_) {}
+              try { if (recog && userMicEnabled) recog.start(); } catch(_) {}
+            }
+          } catch(_) {}
+        }, 5000);
+      } catch(_) {}
       const localVideo = document.getElementById('localVideo');
       const placeholder = document.getElementById('personPlaceholder');
       // ensure camera starts disabled if present
@@ -179,6 +256,84 @@
       updateVideo();
       videoBtn.classList.toggle('btn-danger', !(videoTrack && videoTrack.enabled));
 
+      // Start browser speech recognition (Chromium Web Speech API)
+      try {
+        if (sttWS) { try { sttWS.close(); } catch(_) {} sttWS = null; }
+        sttWS = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + `/call/stt/${cid}`);
+        sttWS.onopen = () => {          // periodic interim sender (every 2s)
+          try { if (sttInterval) { clearInterval(sttInterval); sttInterval = null; } } catch(_) {}
+          sttInterval = setInterval(() => {
+            try {
+              if (!sttWS || sttWS.readyState !== 1) return;
+              if (!readyToListen || isSpeaking || !userMicEnabled) return;
+              const text = (sttHypo || '').trim();
+              if (text) {
+                sttWS.send(JSON.stringify({ text, interim: true }));
+              }
+            } catch(_) {}
+          }, 2000);
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SR) { console.warn('Web Speech API not supported'); return; }
+          recog = new SR();
+          recog.lang = 'ru-RU';
+          recog.continuous = true;
+          recog.interimResults = false;
+          let enabled = true;
+          const micBtn = document.getElementById('micToggle');
+          const updateMicLabel = () => micBtn.textContent = 'Микрофон: ' + (enabled ? 'Вкл' : 'Выкл');
+          micBtn.onclick = () => {
+            enabled = !enabled;
+            micBtn.classList.toggle('btn-danger', !enabled);
+            updateMicLabel();
+            try { if (enabled) recog.start(); else recog.stop(); } catch(_) {}
+          };
+          updateMicLabel();
+          recog.onresult = (ev) => {
+  for (let i = ev.resultIndex; i < ev.results.length; i++) {
+    const res = ev.results[i];
+    const txt = (res[0] && res[0].transcript ? res[0].transcript : '').trim();
+    if (!txt) continue;
+    if (res.isFinal) {
+      try { sttWS.send(JSON.stringify({ text: txt })); } catch(_) {}
+      sttHypo = '';
+    } else {
+      sttHypo = txt;
+    }
+  }
+};
+          recog.onend = () => { if (enabled) { try { if (userMicEnabled && readyToListen &&  !isSpeaking) recog.start(); } catch(_) {}  } };
+          try { if (userMicEnabled && readyToListen &&  !isSpeaking) recog.start(); } catch(_) {} 
+
+          // Half‑duplex overrides: ensure bot never listens while speaking
+          try {
+            const micBtn2 = document.getElementById('micToggle');
+            const updateMicLabel2 = () => micBtn2.textContent = 'Микрофон: ' + (userMicEnabled ? 'Вкл' : 'Выкл');
+            micBtn2.onclick = () => {
+              userMicEnabled = !userMicEnabled;
+              micBtn2.classList.toggle('btn-danger', !userMicEnabled);
+              updateMicLabel2();
+              const aSender = pc && pc.getSenders().find(s=>s.track && s.track.kind==='audio');
+              if (aSender && aSender.track) aSender.track.enabled = !!userMicEnabled && !isSpeaking;
+              try { if (recog) { if (userMicEnabled && !isSpeaking) recog.start(); else recog.stop(); } } catch(_) {}
+            };
+            updateMicLabel2();
+            // Only forward final results when not speaking
+            recog.onresult = (ev) => {
+              for (let i = ev.resultIndex; i < ev.results.length; i++) {
+                const res = ev.results[i];
+                if (res.isFinal) {
+                  const text = (res[0] && res[0].transcript ? res[0].transcript : '').trim();
+                  if (text && !isSpeaking && userMicEnabled) {
+                    try { sttWS.send(JSON.stringify({ text })); } catch(_) {}
+                  }
+                }
+              }
+            };
+            recog.onend = () => { if (userMicEnabled && !isSpeaking) { try { if (userMicEnabled && readyToListen &&  !isSpeaking) recog.start(); } catch(_) {}  } };
+          } catch(_) {}
+        };
+      } catch (e) { console.warn('STT init failed', e); }
+
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
@@ -220,6 +375,11 @@
       }
       try { if (ws) { ws.close(); } } catch(_) {}
       ws = null;
+      try { if (sttWS) { sttWS.close(); } } catch(_) {}
+      sttWS = null;
+      try { if (sttInterval) { clearInterval(sttInterval); sttInterval = null; } } catch(_) {}
+      try { if (recog) { recog.stop(); } } catch(_) {}
+      recog = null;
     } finally {
       document.getElementById('joinBtn').disabled = false;
       document.getElementById('leaveBtn').disabled = true;
