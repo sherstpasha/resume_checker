@@ -1,36 +1,121 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Кандидаты</h1>
-
-
+<h1>Рейтинг</h1>
 
 <form method="get" class="filters">
   <select name="status">
-    <option value="">— любой статус —</option>
+    <option value="">Все статусы</option>
     {% for code,label in STATUS_CHOICES %}
       <option value="{{ code }}" {% if filter_status==code %}selected{% endif %}>{{ label }}</option>
     {% endfor %}
   </select>
   <button>Фильтр</button>
+  <input type="hidden" name="q" value="" />
+  <!-- Поиск по id убран из UI -->
+  
 </form>
 
 <table class="table">
-  <thead><tr><th>ID</th><th>ФИО</th><th>Телефон</th><th>Статус</th><th>Средний балл</th><th>Создан</th></tr></thead>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Статус</th>
+      <th>Средний балл</th>
+      <th>Создан</th>
+    </tr>
+  </thead>
   <tbody>
   {% for r in rows %}
     <tr>
-      <td>{{ r.id }}</td>
-      <td><a href="/candidates/{{ r.id }}">{{ r.full_name or "—" }}</a></td>
-      <td>{{ r.phone or "—" }}</td>
+      <td><a href="/candidates/{{ r.id }}">{{ r.id }}</a></td>
       <td><span class="badge">{{ r.status_label }}</span></td>
       <td>{{ r.avg_score if r.avg_score is not none else "—" }}</td>
       <td>{{ r.created_at }}</td>
     </tr>
   {% endfor %}
   </tbody>
-</table>
+  </table>
+
+<hr>
+
+<h2>Статистика</h2>
+
+<div class="grid">
+  <section>
+    <h3>Распределение по статусам</h3>
+    <table class="table">
+      <thead><tr><th>Статус</th><th>Кол-во</th><th>%</th></tr></thead>
+      <tbody>
+        {% for s in by_status %}
+          <tr><td>{{ s.label }}</td><td>{{ s.cnt }}</td><td>{{ "%.1f"|format(s.pct) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p><b>Всего кандидатов:</b> {{ total }}</p>
+  </section>
+
+  <section>
+    <h3>Средний балл (последний анализ)</h3>
+    <p style="font-size: 28px; margin: 12px 0;">
+      {{ "%.1f"|format(avg_all) if avg_all is not none else "—" }}
+    </p>
+  </section>
+</div>
+
+<div class="grid">
+  <section>
+    <h3>Топ вакансий</h3>
+    <canvas id="chartVac" height="140"></canvas>
+  </section>
+  <section>
+    <h3>Пол</h3>
+    <canvas id="chartGen" height="140"></canvas>
+  </section>
+</div>
+
+<div class="grid">
+  <section>
+    <h3>Города</h3>
+    <canvas id="chartCity" height="160"></canvas>
+  </section>
+  <section>
+    <h3>Средний возраст по вакансиям</h3>
+    <canvas id="chartAge" height="160"></canvas>
+  </section>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-  // Автообновление списка каждые 10 секунд
-  setInterval(() => location.reload(), 10000);
+  const vacLabels = {{ vac_labels|safe }};
+  const vacValues = {{ vac_values|safe }};
+  const genLabels = {{ gen_labels|safe }};
+  const genValues = {{ gen_values|safe }};
+  const cityLabels = {{ city_labels|safe }};
+  const cityValues = {{ city_values|safe }};
+  const ageLabels = {{ age_labels|safe }};
+  const ageValues = {{ age_values|safe }};
+
+  function mkBar(ctx, labels, data, title) {
+    return new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: title, data, backgroundColor: '#4f81bd' }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+  }
+  function mkPie(ctx, labels, data) {
+    return new Chart(ctx, {
+      type: 'pie',
+      data: { labels, datasets: [{ data, backgroundColor: ['#4caf50','#ffc107','#f44336','#2196f3','#9c27b0','#795548'] }] },
+      options: { responsive: true }
+    });
+  }
+
+  if (vacLabels.length) mkBar(document.getElementById('chartVac'), vacLabels, vacValues, 'Кандидаты по вакансиям');
+  if (genLabels.length) mkPie(document.getElementById('chartGen'), genLabels, genValues);
+  if (cityLabels.length) mkBar(document.getElementById('chartCity'), cityLabels, cityValues, 'Кандидаты по городам');
+  if (ageLabels.length) mkBar(document.getElementById('chartAge'), ageLabels, ageValues, 'Средний возраст');
 </script>
+<script>
+  setInterval(() => location.reload(), 10000);
+  </script>
 {% endblock %}

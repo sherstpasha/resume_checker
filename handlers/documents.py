@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 from utils import extract_text, load_job_requirements_many, list_requirement_files
 from agents.resume_analyzer import ResumeAnalyzerAgent
-from db import create_candidate_pending, save_analysis_for_candidate, acquire_agent_lock, release_agent_lock
+from db import create_candidate_pending, save_analysis_for_candidate, acquire_agent_lock, release_agent_lock, update_candidate_file
 
 
 # Подтягиваем .env при локальном запуске
@@ -59,7 +59,8 @@ async def on_document(message: types.Message):
         save_dir = os.path.join(FILES_DIR, str(message.chat.id))
         os.makedirs(save_dir, exist_ok=True)
         orig_name = os.path.basename(doc.file_name or "document")
-        unique_name = f"{uuid.uuid4().hex[:12]}_{orig_name}"
+        _, ext = os.path.splitext(orig_name)
+        unique_name = f"{uuid.uuid4().hex[:12]}{ext}"
         local_path = os.path.join(save_dir, unique_name)
 
         file = await message.bot.get_file(doc.file_id)
@@ -88,9 +89,24 @@ async def on_document(message: types.Message):
 
     # --- Ставит в очередь: создаём кандидата со статусом ожидания и запускаем фоновую задачу анализа ---
     try:
+        # Создаём карточку без привязки файла, затем переименуем файл под ID
         candidate_id = await create_candidate_pending(
-            resume_path=local_path, raw_resume_text=resume_text
+            resume_path=None, raw_resume_text=resume_text
         )
+        try:
+            _base, ext = os.path.splitext(local_path)
+            new_path = os.path.join(os.path.dirname(local_path), f"{candidate_id}{ext}")
+            try:
+                os.replace(local_path, new_path)
+                local_path = new_path
+            except Exception:
+                pass
+            try:
+                await update_candidate_file(candidate_id, local_path)
+            except Exception:
+                pass
+        except Exception:
+            pass
     except Exception as e:
         await message.answer(f"Не удалось создать запись кандидата: {e}")
         return

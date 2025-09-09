@@ -1,7 +1,20 @@
-body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; }
-.topnav { background:#111; padding:10px 16px; }
-.topnav a { color:#fff; margin-right:12px; text-decoration:none; }
-.container { max-width:1000px; margin: 20px auto; padding: 0 16px; }
+html { margin:0; padding:0; background:#fff; }
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; padding:0; background:#fff; }
+
+:root { --nav-h: 56px; }
+.topnav {
+  background:#111;
+  position: fixed;
+  top:0; left:0; right:0;
+  z-index:100;
+  height: var(--nav-h);
+  display:flex;
+  align-items:center;
+  padding:0 16px;
+}
+.topnav a { color:#fff; margin-right:16px; text-decoration:none; font-weight:500; }
+.container { max-width:1000px; margin: calc(var(--nav-h) + 24px) auto 20px; padding: 0 16px; }
+body { min-height: 100vh; }
 .table { width:100%; border-collapse: collapse; }
 .table th, .table td { border-bottom:1px solid #eee; padding:8px; text-align:left; }
 .badge { background:#eef; padding:3px 8px; border-radius:12px; }
