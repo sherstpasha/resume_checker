@@ -79,7 +79,7 @@ async def index(request: Request, q: str | None = None, status: str | None = Non
 
         cur2 = await db.execute(
             """
-            SELECT c.id as cid, c.age, c.gender, c.address, a.avg_score, a.summary, a.raw_json, c.city
+            SELECT c.id as cid, c.age, c.gender, a.avg_score, a.summary, a.raw_json, c.city
             FROM candidates c
             JOIN (
               SELECT candidate_id, MAX(id) AS last_id
@@ -112,7 +112,7 @@ async def index(request: Request, q: str | None = None, status: str | None = Non
     for r in last_rows:
         g = (r.get("gender") or "не указан").strip().lower()
         gender_counts[g] = gender_counts.get(g, 0) + 1
-        city = r.get("city") or city_from_address(r.get("address"))
+        city = r.get("city") or "не указан"
         city_counts[city] = city_counts.get(city, 0) + 1
 
         chosen = None
@@ -392,7 +392,6 @@ async def stats(request: Request):
         chosen = chosen or "—"
         vacancy_counts[chosen] = vacancy_counts.get(chosen, 0) + 1
 
-        # age per vacancy
         try:
             age = int(r["age"]) if r.get("age") is not None else None
         except Exception:
