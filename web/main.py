@@ -2,6 +2,7 @@ import os
 import json as _json
 import re as _re
 import html
+import asyncio
 import aiosqlite
 from fastapi import FastAPI, Request, Form, UploadFile, File
 from typing import List
@@ -362,3 +363,38 @@ async def requirements_delete(filename: str = Form(...)):
         except Exception:
             pass
     return RedirectResponse(url="/requirements", status_code=303)
+
+
+# Start/stop Telegram bot together with the web app
+_bot_task = None  # type: asyncio.Task | None
+
+
+@app.on_event("startup")
+async def _start_bot():
+    global _bot_task
+    if _bot_task and not _bot_task.done():
+        return
+
+    async def _runner():
+        try:
+            from bot import main as bot_main
+            await bot_main()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            # Do not crash the web app if bot fails
+            print(f"[bot] stopped with error: {e}")
+
+    _bot_task = asyncio.create_task(_runner(), name="telegram-bot")
+
+
+@app.on_event("shutdown")
+async def _stop_bot():
+    global _bot_task
+    if _bot_task and not _bot_task.done():
+        _bot_task.cancel()
+        try:
+            await _bot_task
+        except asyncio.CancelledError:
+            pass
+    _bot_task = None

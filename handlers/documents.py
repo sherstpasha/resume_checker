@@ -1,6 +1,7 @@
 # handlers/documents.py
 import os
 import asyncio
+import uuid
 from aiogram import Router, types, F
 from dotenv import load_dotenv
 
@@ -57,7 +58,9 @@ async def on_document(message: types.Message):
     try:
         save_dir = os.path.join(FILES_DIR, str(message.chat.id))
         os.makedirs(save_dir, exist_ok=True)
-        local_path = os.path.join(save_dir, doc.file_name)
+        orig_name = os.path.basename(doc.file_name or "document")
+        unique_name = f"{uuid.uuid4().hex[:12]}_{orig_name}"
+        local_path = os.path.join(save_dir, unique_name)
 
         file = await message.bot.get_file(doc.file_id)
         # aiogram v3: у бота есть удобный downloader
