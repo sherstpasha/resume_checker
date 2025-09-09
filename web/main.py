@@ -3,7 +3,8 @@ import json as _json
 import re as _re
 import html
 import aiosqlite
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, UploadFile, File
+from typing import List
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -101,7 +102,7 @@ async def candidate_detail(request: Request, cid: int):
     for it in analyses:
         raw = it.get("raw_json")
         try:
-            it["report"] = json.loads(raw) if raw else None
+            it["report"] = _json.loads(raw) if raw else None
         except Exception:
             it["report"] = None
         # build highlighted resume from annotations if any
