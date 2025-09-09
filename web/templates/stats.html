@@ -2,7 +2,7 @@
 {% block content %}
 <h1>Статистика</h1>
 <div class="grid">
-  <section class="card">
+  <section>
     <h3>Распределение статусов</h3>
     <table class="table">
       <thead><tr><th>Статус</th><th>Кол-во</th><th>%</th></tr></thead>
@@ -15,7 +15,7 @@
     <p><b>Всего кандидатов:</b> {{ total }}</p>
   </section>
 
-  <section class="card">
+  <section>
     <h3>Средний балл (последние анализы)</h3>
     <p style="font-size: 28px; margin: 12px 0;">
       {{ "%.1f"|format(avg_all) if avg_all is not none else "—" }}
@@ -24,11 +24,11 @@
 </div>
 
 <div class="grid">
-  <section class="card">
+  <section>
     <h3>Кандидаты по вакансиям</h3>
     <canvas id="chartVac" height="140"></canvas>
   </section>
-  <section class="card">
+  <section>
     <h3>Гендер</h3>
     <canvas id="chartGen" height="140"></canvas>
   </section>

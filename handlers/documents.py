@@ -188,10 +188,8 @@ async def on_document(message: types.Message):
 
             if isinstance(avg_score, int):
                 if avg_score >= RESUME_THRESHOLD:
-                    call_url = os.getenv("CALL_BASE_URL", "http://localhost:8000") + f"/call/{candidate_id}"
                     await message.answer(
-                        f"Ваше резюме прошло предварительную проверку (средняя оценка: {avg_score}%).\n"
-                        f"Ссылка на созвон: {call_url}"
+                        f"Ваше резюме прошло предварительную проверку (средняя оценка: {avg_score}%). Мы свяжемся с вами."
                     )
                 else:
                     feedback = summary or "Спасибо за интерес к вакансии. Сейчас соответствие недостаточно."

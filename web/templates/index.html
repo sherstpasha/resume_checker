@@ -2,44 +2,39 @@
 {% block content %}
 <h1>Кандидаты</h1>
 
-<div class="toolbar card">
-  {% if upload_enabled %}
-  <form action="/candidates/upload" method="post" enctype="multipart/form-data" class="inline" style="display:contents">
-    <div class="file-row">
-      <input id="uploadFiles" class="file-input" type="file" name="files" multiple onchange="this.form.submit()">
-      <label for="uploadFiles" class="file-label">Выбрать файлы</label>
-    </div>
+{% if upload_enabled %}
+<form action="/candidates/upload" method="post" enctype="multipart/form-data" class="inline" style="margin:10px 0 16px 0;">
+  <input type="file" name="files" multiple>
+  <button>Добавить кандидатов</button>
+  <span class="muted">Выберите один или несколько файлов резюме</span>
   </form>
-  {% endif %}
+{% endif %}
 
-  <form method="get" class="filters" style="margin:0">
-    <select name="status">
-      <option value="">— любой статус —</option>
-      {% for code,label in STATUS_CHOICES %}
-        <option value="{{ code }}" {% if filter_status==code %}selected{% endif %}>{{ label }}</option>
-      {% endfor %}
-    </select>
-    <button class="btn">Фильтр</button>
-  </form>
-</div>
+<form method="get" class="filters">
+  <select name="status">
+    <option value="">— любой статус —</option>
+    {% for code,label in STATUS_CHOICES %}
+      <option value="{{ code }}" {% if filter_status==code %}selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <button>Фильтр</button>
+</form>
 
-<div class="card">
 <table class="table">
   <thead><tr><th>ID</th><th>ФИО</th><th>Телефон</th><th>Статус</th><th>Средний балл</th><th>Создан</th></tr></thead>
   <tbody>
   {% for r in rows %}
-    <tr class="row-status-{{ r.candidate_status }}">
+    <tr>
       <td>{{ r.id }}</td>
       <td><a href="/candidates/{{ r.id }}">{{ r.full_name or "—" }}</a></td>
       <td>{{ r.phone or "—" }}</td>
-      <td><span class="badge status-{{ r.candidate_status }}">{{ r.status_label }}</span></td>
+      <td><span class="badge">{{ r.status_label }}</span></td>
       <td>{{ r.avg_score if r.avg_score is not none else "—" }}</td>
       <td>{{ r.created_at }}</td>
     </tr>
   {% endfor %}
   </tbody>
 </table>
-</div>
 <script>
   // Автообновление списка каждые 10 секунд
   setInterval(() => location.reload(), 10000);
