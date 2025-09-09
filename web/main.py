@@ -1,31 +1,21 @@
 import os
-import json
+import json as _json
+import re as _re
 import html
 import aiosqlite
-from fastapi import FastAPI, Request, Form, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from typing import List
 from dotenv import load_dotenv
-from utils import extract_text, load_job_requirements_many, parse_job_paths_env, list_requirement_files
-from agents.resume_analyzer import ResumeAnalyzerAgent
-from db import create_candidate_and_analysis
+from utils import SUPPORTED_REQ_EXTS, build_highlighted_resume, city_from_address
 
-# Load .env so env vars are available when running via uvicorn
+
 load_dotenv()
 
 DB_PATH = os.getenv("DB_PATH", "./hr_bot.sqlite3")
 REQ_DIR = os.getenv("JOB_REQUIREMENTS_DIR", "./requirements")
 os.makedirs(REQ_DIR, exist_ok=True)
-API_BASE_URL = os.getenv("API_BASE_URL")
-MODEL_NAME = os.getenv("MODEL_NAME")
-FILES_DIR = os.getenv("FILES_DIR", "./storage")
-os.makedirs(FILES_DIR, exist_ok=True)
-RESUME_THRASH = os.getenv("RESUME_THRASH")
-RESUME_THRESHOLD = int(RESUME_THRASH) if RESUME_THRASH is not None else int(os.getenv("RESUME_THRESHOLD", "75"))
-JOB_DESCRIPTION_PATHS = os.getenv("JOB_DESCRIPTION_PATHS", "")
-JOB_DESCRIPTION_PATH_LEGACY = os.getenv("JOB_DESCRIPTION_PATH", "")
 
 app = FastAPI(title="HR Resume Bot — Admin")
 app.mount(
@@ -36,18 +26,12 @@ app.mount(
 templates = Jinja2Templates(
     directory=os.path.join(os.path.dirname(__file__), "templates")
 )
-agent = (
-    ResumeAnalyzerAgent(api_base_url=API_BASE_URL, model_name=MODEL_NAME)
-    if (API_BASE_URL and MODEL_NAME)
-    else None
-)
+agent = None
 
 STATUS_CHOICES = [
     ("screen_pending", "Ожидает скрининг"),
     ("screen_failed", "Не прошёл скрининг"),
     ("screen_passed", "Прошёл скрининг"),
-    ("interview_failed", "Собеседование не успешно"),
-    ("interview_passed", "Собеседование успешно"),
 ]
 
 
@@ -58,238 +42,6 @@ def status_label(code: str) -> str:
     return code or "—"
 
 
-def _parse_line_ranges_spec(spec) -> list[int]:
-    # Accept int, "1-3,5,7-8", list[int]
-    out: list[int] = []
-    if isinstance(spec, int):
-        return [spec]
-    if isinstance(spec, list):
-        for x in spec:
-            if isinstance(x, int):
-                out.append(x)
-            elif isinstance(x, str) and x.isdigit():
-                out.append(int(x))
-        return out
-    if isinstance(spec, str):
-        parts = [p.strip() for p in spec.split(",") if p.strip()]
-        for p in parts:
-            if "-" in p:
-                try:
-                    s, e = p.split("-", 1)
-                    s = int(s.strip())
-                    e = int(e.strip())
-                    if s <= e:
-                        out.extend(list(range(s, e + 1)))
-                except Exception:
-                    continue
-            elif p.isdigit():
-                out.append(int(p))
-    return out
-
-
-def _build_highlighted_resume(text: str, annotations: list[dict] | None) -> str:
-    if not text:
-        return '<div class="muted">Текст резюме отсутствует</div>'
-    if not annotations:
-        # Вернём построчно с номерами для визуальной синхронизации
-        lines = text.splitlines()
-        blocks = []
-        for i, line_text in enumerate(lines, start=1):
-            blocks.append(
-                f'<div class="line" data-line="{i}">{html.escape(line_text)}</div>'
-            )
-        return f"<div class=\"resume-annotated\">{''.join(blocks)}</div>"
-
-    # Prefer line-based annotations, with support for ranges and full-line highlights
-    has_line = any(
-        isinstance(a, dict)
-        and (
-            "line" in a
-            or "строка" in a
-            or "line_from" in a
-            or "line_to" in a
-            or "lines" in a
-        )
-        for a in annotations
-    )
-
-    if has_line:
-        lines = text.splitlines()
-        per_line = {i + 1: [] for i in range(len(lines))}
-
-        for a in annotations:
-            try:
-                tone = (a.get("тон") or "").lower()
-                if tone not in ("good", "bad", "warn"):
-                    continue
-
-                # parse line indices
-                indices: list[int] = []
-                if "line" in a:
-                    indices = _parse_line_ranges_spec(a.get("line"))
-                elif "строка" in a:
-                    indices = _parse_line_ranges_spec(a.get("строка"))
-                elif "line_from" in a or "line_to" in a:
-                    try:
-                        s = int(a.get("line_from"))
-                        e = int(a.get("line_to", s))
-                        indices = list(range(s, e + 1)) if s <= e else []
-                    except Exception:
-                        indices = []
-                elif "lines" in a:
-                    indices = _parse_line_ranges_spec(a.get("lines"))
-
-                if not indices:
-                    continue
-                # keep only valid
-                indices = [i for i in indices if 1 <= i <= len(lines)]
-                if not indices:
-                    continue
-
-                q = a.get("цитата") or ""
-                s = a.get("start")
-                e = a.get("end")
-                have_fragment = (s is not None and e is not None) or (
-                    q if isinstance(q, str) else ""
-                )
-                comment = str(a.get("комментарий") or "").strip()
-                req = str(a.get("требование") or "").strip()
-
-                for li in indices:
-                    line_text = lines[li - 1]
-                    ls, le = 0, len(line_text)
-                    if have_fragment:
-                        ss = ee = None
-                        if s is not None and e is not None:
-                            try:
-                                ss = int(s)
-                                ee = int(e)
-                            except Exception:
-                                ss = ee = None
-                        if not (
-                            ss is not None
-                            and ee is not None
-                            and 0 <= ss < ee <= len(line_text)
-                        ):
-                            if q and isinstance(q, str) and q:
-                                idx = line_text.find(q)
-                                if idx != -1:
-                                    ss, ee = idx, idx + len(q)
-                        if (
-                            ss is not None
-                            and ee is not None
-                            and 0 <= ss < ee <= len(line_text)
-                        ):
-                            ls, le = ss, ee
-                    per_line[li].append(
-                        {
-                            "s": ls,
-                            "e": le,
-                            "tone": tone,
-                            "comment": comment,
-                            "req": req,
-                        }
-                    )
-            except Exception:
-                continue
-
-        # Render per-line, removing overlaps
-        blocks = []
-        for i, line_text in enumerate(lines, start=1):
-            spans = sorted(per_line.get(i) or [], key=lambda x: (x["s"], x["e"]))
-            cleaned = []
-            last_e = -1
-            for sp in spans:
-                if sp["s"] < last_e:
-                    continue
-                cleaned.append(sp)
-                last_e = sp["e"]
-            pos = 0
-            parts = []
-            for sp in cleaned:
-                if pos < sp["s"]:
-                    parts.append(html.escape(line_text[pos : sp["s"]]))
-                tone_cls = {"good": "hl-good", "bad": "hl-bad", "warn": "hl-warn"}[
-                    sp["tone"]
-                ]
-                data_comment = html.escape(sp["comment"]) if sp["comment"] else ""
-                data_req = html.escape(sp["req"]) if sp["req"] else ""
-                data_tone = html.escape(sp["tone"]) if sp["tone"] else ""
-                content = html.escape(line_text[sp["s"] : sp["e"]])
-                parts.append(
-                    f'<span class="hl {tone_cls}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
-                )
-                pos = sp["e"]
-            if pos < len(line_text):
-                parts.append(html.escape(line_text[pos:]))
-            blocks.append(
-                f"<div class=\"line\" data-line=\"{i}\">{''.join(parts)}</div>"
-            )
-        return f"<div class=\"resume-annotated\">{''.join(blocks)}</div>"
-
-    # Fallback: old whole-text spans
-    L = len(text)
-    spans = []
-    for a in annotations:
-        try:
-            s = int(a.get("start", -1))
-            e = int(a.get("end", -1))
-            tone = (a.get("тон") or "").lower()
-            comment = str(a.get("комментарий") or "").strip()
-            req = str(a.get("требование") or "").strip()
-            quote = a.get("цитата")
-            if 0 <= s < e <= L and tone in ("good", "bad", "warn"):
-                spans.append(
-                    {
-                        "s": s,
-                        "e": e,
-                        "tone": tone,
-                        "comment": comment,
-                        "req": req,
-                        "quote": quote or "",
-                    }
-                )
-                continue
-            if quote and isinstance(quote, str) and tone in ("good", "bad", "warn"):
-                idx = text.find(quote)
-                if idx != -1:
-                    spans.append(
-                        {
-                            "s": idx,
-                            "e": idx + len(quote),
-                            "tone": tone,
-                            "comment": comment,
-                            "req": req,
-                            "quote": quote,
-                        }
-                    )
-        except Exception:
-            continue
-    spans.sort(key=lambda x: (x["s"], x["e"]))
-    cleaned = []
-    last_e = -1
-    for sp in spans:
-        if sp["s"] < last_e:
-            continue
-        cleaned.append(sp)
-        last_e = sp["e"]
-    out = []
-    pos = 0
-    for sp in cleaned:
-        if pos < sp["s"]:
-            out.append(html.escape(text[pos : sp["s"]]))
-        tone_cls = {"good": "hl-good", "bad": "hl-bad", "warn": "hl-warn"}[sp["tone"]]
-        content = html.escape(text[sp["s"] : sp["e"]])
-        data_comment = html.escape(sp["comment"]) if sp["comment"] else ""
-        data_req = html.escape(sp["req"]) if sp["req"] else ""
-        data_tone = html.escape(sp["tone"]) if sp["tone"] else ""
-        out.append(
-            f'<span class="hl {tone_cls}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
-        )
-        pos = sp["e"]
-    if pos < L:
-        out.append(html.escape(text[pos:]))
-    return f"<div class=\"resume-annotated\"><pre>{''.join(out)}</pre></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -324,7 +76,6 @@ async def index(request: Request, q: str | None = None, status: str | None = Non
             "STATUS_CHOICES": STATUS_CHOICES,
             "q": q or "",
             "filter_status": status or "",
-            "upload_enabled": bool(API_BASE_URL and MODEL_NAME),
         },
     )
 
@@ -399,7 +150,7 @@ async def candidate_detail(request: Request, cid: int):
                 ann.extend(anal.get("Аннотации"))
         if not ann:
             ann = None
-        it["resume_html"] = _build_highlighted_resume(
+        it["resume_html"] = build_highlighted_resume(
             candidate.get("raw_resume_text") or "", ann
         )
     return templates.TemplateResponse(
@@ -439,8 +190,6 @@ async def delete_candidate(cid: int):
 
 @app.get("/stats", response_class=HTMLResponse)
 async def stats(request: Request):
-    import json as _json
-    import re as _re
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         # распределение статусов
@@ -486,16 +235,6 @@ async def stats(request: Request):
     city_counts: dict[str, int] = {}
     age_by_vacancy: dict[str, list[int]] = {}
 
-    def city_from_address(addr: str | None) -> str:
-        if not addr:
-            return "—"
-        s = str(addr).strip()
-        for sep in [",", "—", "-", ";", "/"]:
-            if sep in s:
-                s = s.split(sep, 1)[0]
-                break
-        return s.strip() or "—"
-
     for r in last_rows:
         # gender
         g = (r.get("gender") or "не указан").strip().lower()
@@ -518,7 +257,9 @@ async def stats(request: Request):
             pass
         if not chosen:
             s = (r.get("summary") or "").strip()
-            m = _re.search(r"ваканси[ие]\s+['\"]([^'\"]+)['\"]", s, flags=_re.IGNORECASE)
+            m = _re.search(
+                r"ваканси[ие]\s+['\"]([^'\"]+)['\"]", s, flags=_re.IGNORECASE
+            )
             if m:
                 chosen = m.group(1).strip()
         chosen = chosen or "—"
@@ -563,21 +304,6 @@ async def stats(request: Request):
             "age_values": _json.dumps(age_values, ensure_ascii=False),
         },
     )
-
-
-@app.get("/logs", response_class=HTMLResponse)
-async def logs(request: Request, limit: int = 200):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM tg_logs ORDER BY id DESC LIMIT ?", (min(limit, 1000),)
-        )
-        rows = [dict(r) for r in await cur.fetchall()]
-    return templates.TemplateResponse("logs.html", {"request": request, "rows": rows})
-
-
-# --------- Requirements management ---------
-SUPPORTED_REQ_EXTS = {".pdf", ".docx", ".txt", ".doc", ".rtf", ".odt"}
 
 
 def _list_requirements():
@@ -635,88 +361,3 @@ async def requirements_delete(filename: str = Form(...)):
         except Exception:
             pass
     return RedirectResponse(url="/requirements", status_code=303)
-
-
-@app.post("/candidates/upload")
-async def candidates_upload(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
-    job_sets = _load_all_job_sets()
-    if not job_sets:
-        return RedirectResponse(url="/requirements", status_code=303)
-
-    saved_any = False
-    for uf in files:
-        name = os.path.basename(uf.filename or "").strip()
-        if not name:
-            continue
-        # save file
-        os.makedirs(FILES_DIR, exist_ok=True)
-        dest = os.path.join(FILES_DIR, name)
-        data = await uf.read()
-        with open(dest, "wb") as f:
-            f.write(data)
-
-        # extract text
-        resume_text = extract_text(dest)
-        if not (resume_text or "").strip():
-            continue
-
-        # create pending candidate and enqueue background analysis
-        try:
-            from db import create_candidate_pending, save_analysis_for_candidate
-            candidate_id = await create_candidate_pending(resume_path=dest, raw_resume_text=resume_text)
-        except Exception:
-            continue
-
-        async def _bg_analyze_and_store(cid: int, text: str, sets: list[dict]):
-            try:
-                import asyncio as _asyncio
-                from db import acquire_agent_lock, release_agent_lock, save_analysis_for_candidate
-                # очередь: один агент обрабатывает по очереди
-                locked = await acquire_agent_lock("screening_agent", timeout_sec=1800, poll_sec=0.5)
-                if not locked:
-                    return
-                loop = _asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, lambda: agent.analyze_and_questions(text, sets))
-                # parse
-                avg_score: int | None = None
-                summary = ""
-                try:
-                    if isinstance(result, dict) and isinstance(result.get("Анализ"), dict):
-                        avg_score = int(result["Анализ"].get("Средняя оценка"))
-                        summary = str(result["Анализ"].get("Общий вывод", ""))
-                except Exception:
-                    pass
-                status = (result.get("Статус") or {}) if isinstance(result, dict) else {}
-                is_resume = bool(status.get("Это резюме", True))
-                await save_analysis_for_candidate(
-                    candidate_id=cid,
-                    avg_score=avg_score if isinstance(avg_score, int) else -1,
-                    verdict=("positive" if (isinstance(avg_score, int) and avg_score >= RESUME_THRESHOLD) else "negative"),
-                    summary=summary or "—",
-                    raw_json=result,
-                    is_resume=is_resume,
-                    full_name=(result.get("Кандидат", {}) or {}).get("ФИО") if isinstance(result, dict) else None,
-                    age=(result.get("Кандидат", {}) or {}).get("Возраст") if isinstance(result, dict) else None,
-                    gender=(result.get("Кандидат", {}) or {}).get("Пол") if isinstance(result, dict) else None,
-                    phone=(result.get("Кандидат", {}) or {}).get("Телефон") if isinstance(result, dict) else None,
-                    address=(result.get("Кандидат", {}) or {}).get("Адрес") if isinstance(result, dict) else None,
-                )
-            except Exception:
-                pass
-            finally:
-                try:
-                    await release_agent_lock("screening_agent")
-                except Exception:
-                    pass
-
-        background_tasks.add_task(_bg_analyze_and_store, candidate_id, resume_text, job_sets)
-        saved_any = True
-
-    return RedirectResponse(url="/", status_code=303)
-def _load_all_job_sets():
-    paths = set(parse_job_paths_env(JOB_DESCRIPTION_PATHS))
-    for p in parse_job_paths_env(JOB_DESCRIPTION_PATH_LEGACY):
-        paths.add(p)
-    for p in list_requirement_files(REQ_DIR):
-        paths.add(p)
-    return load_job_requirements_many(sorted(paths))

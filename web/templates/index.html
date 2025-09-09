@@ -2,13 +2,7 @@
 {% block content %}
 <h1>Кандидаты</h1>
 
-{% if upload_enabled %}
-<form action="/candidates/upload" method="post" enctype="multipart/form-data" class="inline" style="margin:10px 0 16px 0;">
-  <input type="file" name="files" multiple>
-  <button>Добавить кандидатов</button>
-  <span class="muted">Выберите один или несколько файлов резюме</span>
-  </form>
-{% endif %}
+
 
 <form method="get" class="filters">
   <select name="status">

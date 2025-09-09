@@ -1,16 +1,12 @@
 # handlers/documents.py
 import os
+import asyncio
 from aiogram import Router, types, F
 from dotenv import load_dotenv
 
-from utils import (
-    extract_text,
-    load_job_requirements_many,
-    parse_job_paths_env,
-    list_requirement_files,
-)
+from utils import extract_text, load_job_requirements_many, list_requirement_files
 from agents.resume_analyzer import ResumeAnalyzerAgent
-from db import create_candidate_and_analysis, log_event, create_candidate_pending, save_analysis_for_candidate
+from db import create_candidate_pending, save_analysis_for_candidate, acquire_agent_lock, release_agent_lock
 
 
 # Подтягиваем .env при локальном запуске
@@ -20,13 +16,7 @@ load_dotenv()
 API_BASE_URL = os.getenv("API_BASE_URL")
 MODEL_NAME = os.getenv("MODEL_NAME")
 FILES_DIR = os.getenv("FILES_DIR", "./storage")
-JOB_DESCRIPTION_PATHS = os.getenv(
-    "JOB_DESCRIPTION_PATHS", ""
-)  # список путей через , ; или перевод строки
-# Для обратной совместимости: поддержка старой переменной (одна строка, можно с запятыми)
-JOB_DESCRIPTION_PATH_LEGACY = os.getenv("JOB_DESCRIPTION_PATH", "")
-# Папка с требованиями (каждый файл = отдельная вакансия)
-JOB_REQUIREMENTS_DIR = os.getenv("JOB_REQUIREMENTS_DIR", "")
+JOB_REQUIREMENTS_DIR = os.getenv("JOB_REQUIREMENTS_DIR", "")  # папка с файлами требований
 RESUME_THRASH = os.getenv("RESUME_THRASH")
 RESUME_THRESHOLD = (
     int(RESUME_THRASH)
@@ -50,18 +40,7 @@ def is_supported(filename: str) -> bool:
 async def on_document(message: types.Message):
     doc: types.Document = message.document
 
-    # Лог: получили документ
-    await log_event(
-        chat_id=message.chat.id,
-        user_id=(message.from_user.id if message.from_user else None),
-        username=(message.from_user.username if message.from_user else None),
-        event="document_received",
-        payload={
-            "file_name": doc.file_name,
-            "mime": doc.mime_type,
-            "size": doc.file_size,
-        },
-    )
+    # Получен документ
 
     # Проверка расширения
     if not is_supported(doc.file_name or ""):
@@ -84,54 +63,23 @@ async def on_document(message: types.Message):
         # aiogram v3: у бота есть удобный downloader
         await message.bot.download(file, destination=local_path)
     except Exception as e:
-        await log_event(
-            message.chat.id,
-            message.from_user.id if message.from_user else None,
-            message.from_user.username if message.from_user else None,
-            "save_failed",
-            {"error": str(e)},
-        )
         await message.answer(f"Не удалось сохранить файл: {e}")
         return
 
     # --- Извлекаем текст из файла ---
     resume_text = extract_text(local_path)
     if not resume_text.strip():
-        await log_event(
-            message.chat.id,
-            message.from_user.id if message.from_user else None,
-            message.from_user.username if message.from_user else None,
-            "extract_failed",
-            {"reason": "empty_text"},
-        )
         await message.answer(
             "Не получилось извлечь текст из файла. Попробуйте другой формат."
         )
         return
 
-    # --- Загружаем требования вакансии ---
-    # 1) из новой переменной JOB_DESCRIPTION_PATHS
-    paths = set(parse_job_paths_env(JOB_DESCRIPTION_PATHS))
-    # 2) fallback: из старой JOB_DESCRIPTION_PATH (могут быть и запятые)
-    if not paths and JOB_DESCRIPTION_PATH_LEGACY:
-        for p in parse_job_paths_env(JOB_DESCRIPTION_PATH_LEGACY):
-            paths.add(p)
-    # 3) из папки JOB_REQUIREMENTS_DIR (все файлы с поддерживаемыми расширениями)
-    for p in list_requirement_files(JOB_REQUIREMENTS_DIR):
-        paths.add(p)
-
-    job_sets = load_job_requirements_many(sorted(paths))
+    # --- Загружаем требования вакансии только из папки JOB_REQUIREMENTS_DIR ---
+    paths = list_requirement_files(JOB_REQUIREMENTS_DIR)
+    job_sets = load_job_requirements_many(paths)
     if not job_sets:
-        await log_event(
-            message.chat.id,
-            message.from_user.id if message.from_user else None,
-            message.from_user.username if message.from_user else None,
-            "requirements_missing",
-            {"paths": paths},
-        )
         await message.answer(
-            "Не удалось загрузить требования вакансий. "
-            "Проверьте переменные JOB_DESCRIPTION_PATHS/JOB_DESCRIPTION_PATH или папку JOB_REQUIREMENTS_DIR."
+            "Не удалось загрузить требования вакансий. Проверьте папку JOB_REQUIREMENTS_DIR."
         )
         return
 
@@ -144,11 +92,9 @@ async def on_document(message: types.Message):
         await message.answer(f"Не удалось создать запись кандидата: {e}")
         return
 
-    import asyncio
     async def _run_analysis_and_notify():
         try:
             # глобальная очередь агента, чтобы не было параллельных запросов
-            from db import acquire_agent_lock, release_agent_lock
             locked = await acquire_agent_lock("screening_agent", timeout_sec=1800, poll_sec=0.5)
             if not locked:
                 await message.answer("Очередь обработки занята. Попробуйте позже.")
@@ -199,13 +145,8 @@ async def on_document(message: types.Message):
             else:
                 await message.answer("Получен нестандартный ответ от анализатора.")
         except Exception as e:
-            await log_event(
-                message.chat.id,
-                message.from_user.id if message.from_user else None,
-                message.from_user.username if message.from_user else None,
-                "analyze_failed_bg",
-                {"error": str(e)},
-            )
+            # Ошибка анализа в фоне — уведомим кратко
+            await message.answer("Ошибка анализа резюме. Попробуйте позже.")
         finally:
             try:
                 await release_agent_lock("screening_agent")

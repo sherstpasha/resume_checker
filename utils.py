@@ -5,6 +5,15 @@ import json
 from docx import Document
 import textract
 from pypdf import PdfReader
+import html
+
+try:
+    from striprtf.striprtf import rtf_to_text
+except Exception:
+    rtf_to_text = None
+
+
+SUPPORTED_REQ_EXTS = {".pdf", ".docx", ".txt", ".doc", ".rtf", ".odt"}
 
 
 def strip_thinking_tags(text: str, tags=None) -> str:
@@ -18,82 +27,6 @@ def strip_thinking_tags(text: str, tags=None) -> str:
         text = re.sub(rf"</?{tag}>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<\|[^>]+\|>", "", text)
     return "\n".join(line for line in text.splitlines() if line.strip()).strip()
-
-
-def clean_and_extract_ssml(text: str) -> str:
-    text = strip_thinking_tags(text)
-    m = re.search(r"<speak>.*?</speak>", text, flags=re.DOTALL | re.IGNORECASE)
-    return m.group(0) if m else f"<speak>{text.strip()}</speak>"
-
-
-def sanitize_ssml_for_silero(ssml: str) -> str:
-    # нормализация
-    ssml = ssml.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-    ssml = ssml.replace("&nbsp;", " ")
-    ssml = ssml.encode("utf-8", "ignore").decode("utf-8", "ignore")
-
-    # убираем p/s
-    ssml = re.sub(r"</?\s*p\s*>", "", ssml, flags=re.IGNORECASE)
-    ssml = re.sub(r"</?\s*s\s*>", "", ssml, flags=re.IGNORECASE)
-
-    # break → [[pause]]
-    ssml = re.sub(
-        r"<\s*break\s+time\s*=\s*\"([0-9]+)ms\"\s*/?\s*>",
-        r"[[pause \1 ms]]",
-        ssml,
-        flags=re.IGNORECASE,
-    )
-
-    # prosody → speed/pitch
-    def _prosody_to_silero(m):
-        inner = m.group(2)
-        rate = re.search(r'rate="([^"]+)"', m.group(1))
-        pitch = re.search(r'pitch="([^"]+)"', m.group(1))
-        pre, post = "", ""
-        if rate:
-            r = rate.group(1)
-            if r in ("x-slow", "slow"):
-                pre += "[[speed 80%]]"
-                post = "[[/speed]]" + post
-            if r in ("fast", "x-fast"):
-                pre += "[[speed 120%]]"
-                post = "[[/speed]]" + post
-        if pitch:
-            p = pitch.group(1)
-            if p in ("low", "x-low"):
-                pre += "[[pitch -20%]]"
-                post = "[[/pitch]]" + post
-            if p in ("high", "x-high"):
-                pre += "[[pitch +20%]]"
-                post = "[[/pitch]]" + post
-        return pre + inner + post
-
-    ssml = re.sub(
-        r"<\s*prosody([^>]*)>(.*?)</\s*prosody\s*>",
-        _prosody_to_silero,
-        ssml,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    # emphasis → CAPS
-    ssml = re.sub(
-        r"<\s*emphasis\s*>(.*?)</\s*emphasis\s*>",
-        lambda m: m.group(1).upper(),
-        ssml,
-        flags=re.IGNORECASE,
-    )
-
-    # speak → убираем
-    ssml = re.sub(r"</?\s*speak\s*>", "", ssml, flags=re.IGNORECASE)
-
-    return ssml.strip()
-
-
-def ssml_to_plain_text(ssml: str) -> str:
-    ssml = re.sub(r"\[\[pause ([0-9]+) ms\]\]", r" ... ", ssml)
-    ssml = re.sub(r"<[^>]+>", "", ssml)
-    ssml = re.sub(r"\s+", " ", ssml).strip()
-    return ssml
 
 
 # ---------- Парсеры файлов ----------
@@ -138,23 +71,21 @@ def extract_text_from_txt(path):
 
 
 def extract_text_from_rtf(path):
-    # Prefer pure-Python parser to avoid external deps
-    try:
-        from striprtf.striprtf import rtf_to_text
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            data = f.read()
-        return rtf_to_text(data) or ""
-    except Exception:
-        # fallback to textract if available
+    if rtf_to_text is not None:
         try:
-            text = textract.process(path)
-            return text.decode("utf-8", errors="ignore")
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                data = f.read()
+            return rtf_to_text(data) or ""
         except Exception:
-            return ""
+            pass
+    try:
+        text = textract.process(path)
+        return text.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 
 def extract_text_from_doc(path):
-    # Legacy .doc — rely on textract if available in env, else empty
     try:
         text = textract.process(path)
         return text.decode("utf-8", errors="ignore")
@@ -200,8 +131,6 @@ def load_job_requirements(path):
 
 
 def parse_job_paths_env(value: str | None) -> list[str]:
-    import re
-
     if not value:
         return []
     parts = re.split(r"[,\n;]+", value)
@@ -229,9 +158,6 @@ def load_job_requirements_many(paths: list[str]) -> list[dict]:
     return res
 
 
-SUPPORTED_REQ_EXTS = {".pdf", ".docx", ".txt", ".doc", ".rtf", ".odt"}
-
-
 def list_requirement_files(dir_path: str | None) -> list[str]:
     """Возвращает список файлов требований в папке (отфильтрованы по расширениям)."""
     if not dir_path:
@@ -249,109 +175,6 @@ def list_requirement_files(dir_path: str | None) -> list[str]:
     return sorted(files)
 
 
-# tts_module.py
-import asyncio
-import edge_tts
-import simpleaudio as sa
-import tempfile
-import os
-import torch
-import soundfile as sf
-import pygame
-
-
-class EdgeTTS:
-    def __init__(self, voice="ru-RU-DmitryNeural", rate="+10%", pitch="+0Hz"):
-        self.voice = voice
-        self.rate = rate
-        self.pitch = pitch
-
-    async def synthesize(self, text: str, out_path: str = None) -> str:
-        if out_path is None:
-            fd, out_path = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-
-        communicate = edge_tts.Communicate(
-            text, self.voice, rate=self.rate, pitch=self.pitch
-        )
-        with open(out_path, "wb") as f:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    f.write(chunk["data"])
-        return out_path
-
-    def speak(self, text: str):
-        path = asyncio.run(self.synthesize(text))
-        pygame.mixer.init()
-        pygame.mixer.music.load(path)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
-        return path
-
-
-class SileroTTS:
-    def __init__(self, device=None, speaker="kseniya", sample_rate=48000):
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        self.speaker = speaker
-        self.sample_rate = sample_rate
-
-        self.model, _ = torch.hub.load(
-            repo_or_dir="snakers4/silero-models",
-            model="silero_tts",
-            language="ru",
-            speaker="v4_ru",
-        )
-        self.model.to(self.device)
-
-    def synthesize(self, text: str, out_path: str = None) -> str:
-        if out_path is None:
-            fd, out_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-
-        audio = self.model.apply_tts(
-            text=text, speaker=self.speaker, sample_rate=self.sample_rate
-        )
-        sf.write(out_path, audio, self.sample_rate)
-        return out_path
-
-    def speak(self, text: str):
-        path = self.synthesize(text)
-        wave_obj = sa.WaveObject.from_wave_file(path)
-        play_obj = wave_obj.play()
-        play_obj.wait_done()
-        return path
-
-
-class FallbackTTS:
-    """Сначала EdgeTTS, если ошибка → SileroTTS"""
-
-    def __init__(self, **kwargs):
-        self.edge = EdgeTTS(
-            voice=kwargs.get("voice", "ru-RU-DmitryNeural"),
-            rate=kwargs.get("rate", "+10%"),
-            pitch=kwargs.get("pitch", "+0Hz"),
-        )
-        self.silero = SileroTTS(
-            device=kwargs.get("device"),
-            speaker=kwargs.get("speaker", "kseniya"),
-            sample_rate=kwargs.get("sample_rate", 48000),
-        )
-
-    def speak(self, text: str):
-        self.silero.speak(text)
-
-
-#        try:
-#            print("🎤 [TTS] EdgeTTS…")
-#            return self.edge.speak(text)
-#        except Exception as e:
-#            print(f"⚠️ EdgeTTS упал ({e}), переключаюсь на Silero.")
-#            return self.silero.speak(text)
-
-
 def extract_json_block(text: str) -> str:
     """
     Возвращает строку с чистым JSON:
@@ -362,7 +185,6 @@ def extract_json_block(text: str) -> str:
         return ""
     t = strip_thinking_tags(text).strip()
 
-    # срезать ограды кода
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.IGNORECASE)
 
     m = re.search(r"\{.*\}", t, flags=re.DOTALL)
@@ -386,31 +208,199 @@ def parse_json_safely(text: str):
         raise ValueError(f"JSON decode failed: {e}\nExtracted: {payload[:500]}")
 
 
-def parse_job_paths_env(value: str | None) -> list[str]:
-    import re
+# ---------- Рендер и утилиты для аннотаций/резюме ----------
+def parse_line_ranges_spec(spec) -> list[int]:
+    """Парсер спецификаций строк: int, "1-3,5,7-8" или list[int]."""
+    out: list[int] = []
+    if isinstance(spec, int):
+        return [spec]
+    if isinstance(spec, list):
+        for x in spec:
+            if isinstance(x, int):
+                out.append(x)
+            elif isinstance(x, str) and x.isdigit():
+                out.append(int(x))
+        return out
+    if isinstance(spec, str):
+        parts = [p.strip() for p in spec.split(",") if p.strip()]
+        for p in parts:
+            if "-" in p:
+                try:
+                    s, e = p.split("-", 1)
+                    s = int(s.strip())
+                    e = int(e.strip())
+                    if s <= e:
+                        out.extend(list(range(s, e + 1)))
+                except Exception:
+                    continue
+            elif p.isdigit():
+                out.append(int(p))
+    return out
 
-    if not value:
-        return []
-    parts = re.split(r"[,\n;]+", value)
-    return [p.strip() for p in parts if p.strip()]
 
-
-def load_job_requirements_many(paths: list[str]) -> list[dict]:
-    """
-    Возвращает список вакансий:
-    [{"id": 1, "name": "<имя из файла>", "path": "<путь>", "requirements": [...]}, ...]
-    Пустые/невалидные файлы игнорируются.
-    """
-    res = []
-    for p in paths or []:
-        try:
-            reqs = load_job_requirements(p)
-        except Exception:
-            reqs = []
-        if reqs:
-            base = os.path.basename(p)
-            name = os.path.splitext(base)[0]
-            res.append(
-                {"id": len(res) + 1, "name": name, "path": p, "requirements": reqs}
+def build_highlighted_resume(text: str, annotations: list[dict] | None) -> str:
+    """Возвращает HTML с подсветками по строкам/фрагментам на основе аннотаций."""
+    if not text:
+        return '<div class="muted">Текст резюме отсутствует</div>'
+    if not annotations:
+        lines = text.splitlines()
+        blocks = []
+        for i, line_text in enumerate(lines, start=1):
+            blocks.append(
+                f'<div class="line" data-line="{i}">{html.escape(line_text)}</div>'
             )
-    return res
+        return f"<div class=\"resume-annotated\">{''.join(blocks)}</div>"
+
+    has_line = any(
+        isinstance(a, dict)
+        and ("line" in a or "строка" in a or "line_from" in a or "line_to" in a or "lines" in a)
+        for a in annotations
+    )
+
+    if has_line:
+        lines = text.splitlines()
+        per_line = {i + 1: [] for i in range(len(lines))}
+
+        for a in annotations:
+            try:
+                tone = (a.get("тон") or "").lower()
+                if tone not in ("good", "bad", "warn"):
+                    continue
+
+                indices: list[int] = []
+                if "line" in a:
+                    indices = parse_line_ranges_spec(a.get("line"))
+                elif "строка" in a:
+                    indices = parse_line_ranges_spec(a.get("строка"))
+                elif "line_from" in a or "line_to" in a:
+                    try:
+                        s = int(a.get("line_from"))
+                        e = int(a.get("line_to", s))
+                        indices = list(range(s, e + 1)) if s <= e else []
+                    except Exception:
+                        indices = []
+                elif "lines" in a:
+                    indices = parse_line_ranges_spec(a.get("lines"))
+
+                if not indices:
+                    continue
+                indices = [i for i in indices if 1 <= i <= len(lines)]
+                if not indices:
+                    continue
+
+                q = a.get("цитата") or ""
+                s = a.get("start")
+                e = a.get("end")
+                have_fragment = (s is not None and e is not None) or (q if isinstance(q, str) else "")
+                comment = str(a.get("комментарий") or "").strip()
+                req = str(a.get("требование") or "").strip()
+
+                for li in indices:
+                    line_text = lines[li - 1]
+                    ls, le = 0, len(line_text)
+                    if have_fragment:
+                        ss = ee = None
+                        if s is not None and e is not None:
+                            try:
+                                ss = int(s)
+                                ee = int(e)
+                            except Exception:
+                                ss = ee = None
+                        if not (ss is not None and ee is not None and 0 <= ss < ee <= len(line_text)):
+                            if q and isinstance(q, str) and q:
+                                idx = line_text.find(q)
+                                if idx != -1:
+                                    ss, ee = idx, idx + len(q)
+                        if ss is not None and ee is not None and 0 <= ss < ee <= len(line_text):
+                            ls, le = ss, ee
+                    per_line[li].append(
+                        {"s": ls, "e": le, "tone": tone, "comment": comment, "req": req}
+                    )
+            except Exception:
+                continue
+
+        blocks = []
+        for i, line_text in enumerate(lines, start=1):
+            spans = sorted(per_line.get(i) or [], key=lambda x: (x["s"], x["e"]))
+            cleaned = []
+            last_e = -1
+            for sp in spans:
+                if sp["s"] < last_e:
+                    continue
+                cleaned.append(sp)
+                last_e = sp["e"]
+            pos = 0
+            parts = []
+            for sp in cleaned:
+                if pos < sp["s"]:
+                    parts.append(html.escape(line_text[pos : sp["s"]]))
+                tone_cls = {"good": "hl-good", "bad": "hl-bad", "warn": "hl-warn"}[sp["tone"]]
+                data_comment = html.escape(sp["comment"]) if sp["comment"] else ""
+                data_req = html.escape(sp["req"]) if sp["req"] else ""
+                data_tone = html.escape(sp["tone"]) if sp["tone"] else ""
+                content = html.escape(line_text[sp["s"] : sp["e"]])
+                parts.append(
+                    f'<span class="hl {tone_cls}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
+                )
+                pos = sp["e"]
+            if pos < len(line_text):
+                parts.append(html.escape(line_text[pos:]))
+            blocks.append(f"<div class=\"line\" data-line=\"{i}\">{''.join(parts)}</div>")
+        return f"<div class=\"resume-annotated\">{''.join(blocks)}</div>"
+
+    # Fallback: whole-text spans
+    L = len(text)
+    spans = []
+    for a in annotations:
+        try:
+            s = int(a.get("start", -1))
+            e = int(a.get("end", -1))
+            tone = (a.get("тон") or "").lower()
+            comment = str(a.get("комментарий") or "").strip()
+            req = str(a.get("требование") or "").strip()
+            quote = a.get("цитата")
+            if 0 <= s < e <= L and tone in ("good", "bad", "warn"):
+                spans.append({"s": s, "e": e, "tone": tone, "comment": comment, "req": req, "quote": quote or ""})
+                continue
+            if quote and isinstance(quote, str) and tone in ("good", "bad", "warn"):
+                idx = text.find(quote)
+                if idx != -1:
+                    spans.append({"s": idx, "e": idx + len(quote), "tone": tone, "comment": comment, "req": req, "quote": quote})
+        except Exception:
+            continue
+    spans.sort(key=lambda x: (x["s"], x["e"]))
+    cleaned = []
+    last_e = -1
+    for sp in spans:
+        if sp["s"] < last_e:
+            continue
+        cleaned.append(sp)
+        last_e = sp["e"]
+    out = []
+    pos = 0
+    for sp in cleaned:
+        if pos < sp["s"]:
+            out.append(html.escape(text[pos : sp["s"]]))
+        tone_cls = {"good": "hl-good", "bad": "hl-bad", "warn": "hl-warn"}[sp["tone"]]
+        content = html.escape(text[sp["s"] : sp["e"]])
+        data_comment = html.escape(sp["comment"]) if sp["comment"] else ""
+        data_req = html.escape(sp["req"]) if sp["req"] else ""
+        data_tone = html.escape(sp["tone"]) if sp["tone"] else ""
+        out.append(
+            f'<span class="hl {tone_cls}" data-comment="{data_comment}" data-req="{data_req}" data-tone="{data_tone}">{content}</span>'
+        )
+        pos = sp["e"]
+    if pos < L:
+        out.append(html.escape(text[pos:]))
+    return f"<div class=\"resume-annotated\"><pre>{''.join(out)}</pre></div>"
+
+
+def city_from_address(addr: str | None) -> str:
+    if not addr:
+        return "—"
+    s = str(addr).strip()
+    for sep in [",", "—", "-", ";", "/"]:
+        if sep in s:
+            s = s.split(sep, 1)[0]
+            break
+    return s.strip() or "—"

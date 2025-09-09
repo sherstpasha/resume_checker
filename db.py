@@ -1,20 +1,14 @@
 # db.py
 import os
 import json
+import time
+import asyncio
 import aiosqlite
 
 DB_PATH = os.getenv("DB_PATH", "./hr_bot.sqlite3")
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS recruiters (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tg_user_id INTEGER UNIQUE,
-  tg_chat_id INTEGER,
-  name TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
 
 CREATE TABLE IF NOT EXISTS candidates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,7 +19,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   address TEXT,
   resume_path TEXT,
   raw_resume_text TEXT,
-  candidate_status TEXT DEFAULT 'screen_pending', -- screen_pending|screen_failed|screen_passed|interview_passed|interview_failed
+  candidate_status TEXT DEFAULT 'screen_pending', -- screen_pending|screen_failed|screen_passed
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -41,16 +35,6 @@ CREATE TABLE IF NOT EXISTS analyses (
   FOREIGN KEY(candidate_id) REFERENCES candidates(id)
 );
 
-CREATE TABLE IF NOT EXISTS tg_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_id INTEGER,
-  user_id INTEGER,
-  username TEXT,
-  event TEXT,
-  payload TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
 -- Простая таблица для блокировок агента (mutex через уникальный ключ)
 CREATE TABLE IF NOT EXISTS agent_locks (
   name TEXT PRIMARY KEY
@@ -63,23 +47,6 @@ async def init_db(db_path: str | None = None):
     async with aiosqlite.connect(path) as db:
         await db.executescript(SCHEMA)
         await db.commit()
-
-
-async def upsert_recruiter(
-    tg_user_id: int, tg_chat_id: int, name: str | None = None
-) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO recruiters(tg_user_id,tg_chat_id,name) VALUES(?,?,?) "
-            "ON CONFLICT(tg_user_id) DO UPDATE SET tg_chat_id=excluded.tg_chat_id, name=COALESCE(excluded.name, recruiters.name)",
-            (tg_user_id, tg_chat_id, name),
-        )
-        await db.commit()
-        cur = await db.execute(
-            "SELECT id FROM recruiters WHERE tg_user_id=?", (tg_user_id,)
-        )
-        row = await cur.fetchone()
-        return int(row[0])
 
 
 async def create_candidate_and_analysis(
@@ -233,22 +200,24 @@ async def save_analysis_for_candidate(
         return int(cur2.lastrowid)
 
 
-async def acquire_agent_lock(name: str = "global", timeout_sec: int = 600, poll_sec: float = 0.5) -> bool:
+async def acquire_agent_lock(
+    name: str = "global", timeout_sec: int = 600, poll_sec: float = 0.5
+) -> bool:
     """Пытается захватить глобальную блокировку агента через SQLite. Возвращает True/False."""
-    import time
     deadline = time.monotonic() + max(1, timeout_sec)
     while True:
         async with aiosqlite.connect(DB_PATH) as db:
-            # на всякий случай обеспечим таблицу
-            await db.execute("CREATE TABLE IF NOT EXISTS agent_locks(name TEXT PRIMARY KEY)")
-            cur = await db.execute("INSERT OR IGNORE INTO agent_locks(name) VALUES (?)", (name,))
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS agent_locks(name TEXT PRIMARY KEY)"
+            )
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO agent_locks(name) VALUES (?)", (name,)
+            )
             await db.commit()
             if cur.rowcount == 1:
                 return True
         if time.monotonic() >= deadline:
             return False
-        # ждём и повторяем
-        import asyncio
         await asyncio.sleep(poll_sec)
 
 
